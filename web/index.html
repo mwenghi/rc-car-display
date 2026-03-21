@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPS Nav - Map Manager</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
+.tabs{display:flex;background:#16213e;border-bottom:2px solid #0f3460}
+.tab{padding:10px 20px;cursor:pointer;color:#8899aa;font-size:14px;border:none;background:none;transition:.2s}
+.tab.active{color:#e94560;border-bottom:2px solid #e94560;margin-bottom:-2px}
+.tab:hover{color:#fff}
+.panel{flex:1;display:none;flex-direction:column;overflow:hidden}
+.panel.active{display:flex}
+#map{flex:1;min-height:300px}
+.controls{background:#16213e;padding:10px 12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.controls label{font-size:13px;color:#8899aa}
+.controls select,.controls input{background:#0f3460;color:#e0e0e0;border:1px solid #333;padding:4px 8px;border-radius:4px;font-size:13px}
+.btn{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600;transition:.2s}
+.btn-primary{background:#e94560;color:#fff}.btn-primary:hover{background:#c73652}
+.btn-danger{background:#6b2020;color:#e88}.btn-danger:hover{background:#8b3030}
+.btn-secondary{background:#0f3460;color:#aab}.btn-secondary:hover{background:#1a4a80}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.info-bar{background:#0d1b3e;padding:8px 12px;font-size:12px;color:#8899aa;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
+.tile-list{max-height:180px;overflow-y:auto;background:#0d1b3e;padding:8px}
+.tile-list table{width:100%;border-collapse:collapse;font-size:12px}
+.tile-list th{text-align:left;color:#8899aa;padding:4px 8px;border-bottom:1px solid #222}
+.tile-list td{padding:3px 8px;border-bottom:1px solid #111}
+.tile-list tr:hover{background:#16213e}
+.progress-wrap{display:none;background:#0d1b3e;padding:10px 12px}
+.progress-bar{height:18px;background:#1a1a2e;border-radius:9px;overflow:hidden;position:relative}
+.progress-fill{height:100%;background:linear-gradient(90deg,#e94560,#53a8b6);transition:width .3s;border-radius:9px}
+.progress-text{position:absolute;top:0;left:0;right:0;text-align:center;font-size:11px;line-height:18px;color:#fff}
+.status-bar{background:#111;padding:6px 12px;font-size:11px;color:#666;display:flex;justify-content:space-between}
+.sel-info{color:#e94560;font-weight:600}
+.screen-section{padding:16px}
+.screen-section h3{color:#e94560;margin-bottom:12px;font-size:15px}
+.screen-grid{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px}
+.screen-btn{padding:10px 16px;border:2px solid #0f3460;border-radius:8px;background:#16213e;color:#8899aa;cursor:pointer;font-size:13px;transition:.2s;min-width:80px;text-align:center}
+.screen-btn:hover{border-color:#53a8b6;color:#fff}
+.screen-btn.active{border-color:#e94560;color:#e94560;background:#1a1a2e}
+</style>
+</head>
+<body>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('map')">Map & Tiles</button>
+  <button class="tab" onclick="switchTab('screens')">Screens</button>
+  <button class="tab" onclick="switchTab('device')">Device</button>
+</div>
+
+<div id="panel-map" class="panel active">
+  <div class="controls">
+    <label>Zoom: <select id="dlZoom"></select></label>
+    <button class="btn btn-secondary" id="btnSelect" onclick="startSelect()">Select Area</button>
+    <span id="selInfo" class="sel-info"></span>
+    <button class="btn btn-primary" id="btnDownload" onclick="startDownload()" disabled>Download</button>
+    <button class="btn btn-danger" id="btnCancel" onclick="cancelDownload()" style="display:none">Cancel</button>
+  </div>
+  <div id="map"></div>
+  <div class="progress-wrap" id="progressWrap">
+    <div style="font-size:12px;margin-bottom:4px" id="progressLabel">Downloading...</div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div><div class="progress-text" id="progressText">0%</div></div>
+  </div>
+  <div class="info-bar">
+    <span id="tileCount">Tiles on SD: loading...</span>
+    <span><button class="btn btn-secondary" onclick="loadTiles()" style="padding:2px 8px;font-size:11px">Refresh</button>
+    <button class="btn btn-danger" onclick="deleteAll()" style="padding:2px 8px;font-size:11px">Delete All</button></span>
+  </div>
+  <div class="tile-list" id="tileList"></div>
+</div>
+
+<div id="panel-screens" class="panel">
+  <div class="screen-section">
+    <h3>Main Display (D1)</h3>
+    <div class="screen-grid" id="d1Screens"></div>
+    <h3>Second Display (D2)</h3>
+    <div class="screen-grid" id="d2Screens"></div>
+  </div>
+</div>
+
+<div id="panel-device" class="panel">
+  <div style="padding:20px">
+    <h3 style="color:#e94560;margin-bottom:12px">Device Status</h3>
+    <div id="deviceInfo" style="font-size:13px;line-height:2">Loading...</div>
+    <button class="btn btn-primary" onclick="loadDeviceInfo()" style="margin-top:12px">Refresh</button>
+    <button class="btn btn-danger" onclick="fetch('/api/nav',{method:'POST'}).then(()=>alert('Entering navigation mode. WiFi will disconnect.'))" style="margin-top:12px">Start Navigation</button>
+  </div>
+</div>
+
+<div class="status-bar">
+  <span id="statusMsg">Ready</span>
+  <span id="wifiInfo"></span>
+</div>
+
+<script>
+const API = '';
+let map, selRect, selBounds, tileGrid, selecting = false;
+let dlPollTimer = null;
+
+// Tabs
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', t.textContent.toLowerCase().includes(name)));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-'+name));
+  if (name === 'device') loadDeviceInfo();
+  if (name === 'screens') loadScreens();
+  if (name === 'map') setTimeout(() => map.invalidateSize(), 100);
+}
+
+// Map init
+function initMap() {
+  map = L.map('map').setView([48.1486, 17.1077], 14);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  const sel = document.getElementById('dlZoom');
+  for (let z = 12; z <= 17; z++) {
+    const o = document.createElement('option');
+    o.value = z; o.text = z; if (z === 15) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+// Rectangle selection
+function startSelect() {
+  if (selecting) { selecting = false; document.getElementById('btnSelect').textContent = 'Select Area'; return; }
+  selecting = true;
+  document.getElementById('btnSelect').textContent = 'Cancel Select';
+  document.getElementById('selInfo').textContent = 'Click and drag on map...';
+  map.dragging.disable();
+
+  let startLL = null;
+  function onDown(e) { startLL = e.latlng; if (selRect) map.removeLayer(selRect); }
+  function onMove(e) {
+    if (!startLL) return;
+    const b = L.latLngBounds(startLL, e.latlng);
+    if (selRect) selRect.setBounds(b); else selRect = L.rectangle(b, {color:'#e94560',weight:2,fillOpacity:.15}).addTo(map);
+  }
+  function onUp(e) {
+    if (!startLL) return;
+    selBounds = L.latLngBounds(startLL, e.latlng);
+    if (selRect) selRect.setBounds(selBounds);
+    map.off('mousedown', onDown); map.off('mousemove', onMove); map.off('mouseup', onUp);
+    map.dragging.enable();
+    selecting = false;
+    document.getElementById('btnSelect').textContent = 'Select Area';
+    updateSelInfo();
+  }
+  map.on('mousedown', onDown); map.on('mousemove', onMove); map.on('mouseup', onUp);
+}
+
+function lon2tile(lon, z) { return Math.floor((lon + 180) / 360 * Math.pow(2, z)); }
+function lat2tile(lat, z) { return Math.floor((1 - Math.log(Math.tan(lat*Math.PI/180) + 1/Math.cos(lat*Math.PI/180)) / Math.PI) / 2 * Math.pow(2, z)); }
+
+function updateSelInfo() {
+  if (!selBounds) return;
+  const z = parseInt(document.getElementById('dlZoom').value);
+  const nw = selBounds.getNorthWest(), se = selBounds.getSouthEast();
+  const x0 = lon2tile(nw.lng, z), x1 = lon2tile(se.lng, z);
+  const y0 = lat2tile(nw.lat, z), y1 = lat2tile(se.lat, z);
+  const count = (x1 - x0 + 1) * (y1 - y0 + 1);
+  tileGrid = {z, x0, y0, x1, y1};
+  const est = Math.ceil(count * 0.7);
+  document.getElementById('selInfo').textContent = `${count} tiles (~${est}s)`;
+  document.getElementById('btnDownload').disabled = count < 1 || count > 500;
+  if (count > 500) document.getElementById('selInfo').textContent += ' TOO MANY!';
+}
+
+document.getElementById('dlZoom').addEventListener('change', () => { if (selBounds) updateSelInfo(); });
+
+// Download
+async function startDownload() {
+  if (!tileGrid) return;
+  setStatus('Starting download...');
+  const r = await fetch(API+'/api/download', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(tileGrid)});
+  const j = await r.json();
+  if (!j.ok) { setStatus('Download failed: ' + (j.error||'unknown')); return; }
+  document.getElementById('progressWrap').style.display = 'block';
+  document.getElementById('btnDownload').disabled = true;
+  document.getElementById('btnCancel').style.display = '';
+  pollProgress();
+}
+
+function pollProgress() {
+  dlPollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(API+'/api/download/status');
+      const j = await r.json();
+      const pct = j.total > 0 ? Math.round(j.done / j.total * 100) : 0;
+      document.getElementById('progressFill').style.width = pct + '%';
+      document.getElementById('progressText').textContent = `${j.done}/${j.total} (${pct}%)`;
+      document.getElementById('progressLabel').textContent = j.active ? `Downloading ${j.current||''}...` : 'Done!';
+      setStatus(j.active ? `Downloading tile ${j.done}/${j.total}` : `Complete! ${j.done} tiles, ${j.errors} errors`);
+      if (!j.active) {
+        clearInterval(dlPollTimer);
+        document.getElementById('btnCancel').style.display = 'none';
+        document.getElementById('btnDownload').disabled = false;
+        loadTiles();
+      }
+    } catch(e) { setStatus('Poll error: '+e.message); }
+  }, 1500);
+}
+
+async function cancelDownload() {
+  await fetch(API+'/api/download/cancel', {method:'POST'});
+  clearInterval(dlPollTimer);
+  document.getElementById('btnCancel').style.display = 'none';
+  document.getElementById('btnDownload').disabled = false;
+  document.getElementById('progressWrap').style.display = 'none';
+  setStatus('Download cancelled');
+}
+
+// Tile list
+async function loadTiles() {
+  try {
+    const r = await fetch(API+'/api/tiles');
+    const j = await r.json();
+    document.getElementById('tileCount').textContent = `Tiles on SD: ${j.total_count} (${(j.total_bytes/1024).toFixed(0)} KB)`;
+    const tbl = j.tiles.length ? '<table><tr><th>Tile</th><th>Size</th><th></th></tr>' +
+      j.tiles.map(t => `<tr><td>${t.z}/${t.x}/${t.y}</td><td>${(t.size/1024).toFixed(1)}K</td><td><button class="btn btn-danger" style="padding:1px 6px;font-size:10px" onclick="delTile('${t.z}_${t.x}_${t.y}')">Del</button></td></tr>`).join('') +
+      '</table>' : '<p style="color:#666;font-size:12px">No tiles on SD card</p>';
+    document.getElementById('tileList').innerHTML = tbl;
+
+    // Show tile coverage on map
+    if (window.coverageLayer) map.removeLayer(window.coverageLayer);
+    if (j.tiles.length) {
+      const rects = [];
+      j.tiles.forEach(t => {
+        const n = Math.pow(2, t.z);
+        const lng0 = t.x / n * 360 - 180;
+        const lng1 = (t.x + 1) / n * 360 - 180;
+        const lat0 = Math.atan(Math.sinh(Math.PI * (1 - 2 * t.y / n))) * 180 / Math.PI;
+        const lat1 = Math.atan(Math.sinh(Math.PI * (1 - 2 * (t.y + 1) / n))) * 180 / Math.PI;
+        rects.push(L.rectangle([[lat0,lng0],[lat1,lng1]], {color:'#53a8b6',weight:1,fillOpacity:.1,interactive:false}));
+      });
+      window.coverageLayer = L.layerGroup(rects).addTo(map);
+    }
+  } catch(e) { document.getElementById('tileCount').textContent = 'Error loading tiles'; }
+}
+
+async function delTile(name) {
+  if (!confirm('Delete tile '+name+'?')) return;
+  await fetch(API+'/api/tiles/'+name, {method:'DELETE'});
+  loadTiles();
+}
+
+async function deleteAll() {
+  if (!confirm('Delete ALL tiles from SD card?')) return;
+  setStatus('Deleting all tiles...');
+  await fetch(API+'/api/tiles', {method:'DELETE'});
+  loadTiles();
+  setStatus('All tiles deleted');
+}
+
+// Device info
+async function loadDeviceInfo() {
+  try {
+    const r = await fetch(API+'/api/status');
+    const j = await r.json();
+    document.getElementById('deviceInfo').innerHTML =
+      `Free Heap: <b>${(j.heap_free/1024).toFixed(0)} KB</b><br>` +
+      `Largest Block: <b>${(j.largest_block/1024).toFixed(0)} KB</b><br>` +
+      `SD Card: <b>${j.sd_total_mb} MB</b><br>` +
+      `WiFi RSSI: <b>${j.wifi_rssi} dBm</b><br>` +
+      `Uptime: <b>${Math.floor(j.uptime_s/60)}m ${j.uptime_s%60}s</b>`;
+    document.getElementById('wifiInfo').textContent = `RSSI: ${j.wifi_rssi}dBm`;
+  } catch(e) { document.getElementById('deviceInfo').textContent = 'Error: '+e.message; }
+}
+
+function setStatus(msg) { document.getElementById('statusMsg').textContent = msg; }
+
+// Screen management
+async function loadScreens() {
+  try {
+    const r = await fetch(API+'/api/screens');
+    const j = await r.json();
+    renderScreenButtons('d1Screens', 1, j.d1.screens, j.d1.current);
+    renderScreenButtons('d2Screens', 2, j.d2.screens, j.d2.current);
+  } catch(e) { console.error('loadScreens:', e); }
+}
+
+function renderScreenButtons(containerId, display, screens, current) {
+  const c = document.getElementById(containerId);
+  c.innerHTML = '';
+  screens.forEach((name, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'screen-btn' + (i === current ? ' active' : '');
+    btn.textContent = name;
+    btn.onclick = () => setScreen(display, i);
+    c.appendChild(btn);
+  });
+}
+
+async function setScreen(display, screen) {
+  try {
+    await fetch(API+'/api/screens', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({display, screen})
+    });
+    setStatus(`Display ${display} → screen ${screen}`);
+    loadScreens();
+  } catch(e) { setStatus('Error: '+e.message); }
+}
+
+// Init
+initMap();
+setTimeout(loadTiles, 500);
+setTimeout(loadDeviceInfo, 1000);
+setTimeout(loadScreens, 800);
+</script>
+</body>
+</html>
