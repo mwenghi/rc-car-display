@@ -119,6 +119,18 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 [1] _reserved        uint8
 ```
 
+### 0x13 CMD_TRACK (2 bytes payload, on event)
+```
+[0] command          uint8    0=enter_select 1=exit_select 2=next 3=prev
+                              4=confirm 5=start_nav 6=preview
+[1] _reserved        uint8
+```
+
+**Track selection via steering/throttle (when selection mode is active):**
+- Steer left (pos < 80): previous track
+- Steer right (pos > 175): next track
+- Throttle to full (>90%) then back to 0 (<10%): confirm selection
+
 ### 0xFE HEARTBEAT (2 bytes payload, 2 Hz)
 ```
 [0..1] uptime_sec    uint16   MEGA uptime seconds (wraps at 65535)

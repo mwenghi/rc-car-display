@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Route Editor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:sans-serif;background:#1a1a2e;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
+.toolbar{background:#16213e;padding:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px}
+.btn{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600}
+.btn-p{background:#e94560;color:#fff}.btn-p:hover{background:#c73652}
+.btn-s{background:#0f3460;color:#aab}.btn-s:hover{background:#1a4a80}
+.btn-d{background:#6b2020;color:#e88}.btn-d:hover{background:#8b3030}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+#map{flex:1}
+.info{background:#0d1b3e;padding:6px 8px;font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px}
+.routes{background:#0d1b3e;max-height:120px;overflow-y:auto;padding:4px 8px;font-size:12px}
+.routes table{width:100%;border-collapse:collapse}
+.routes td{padding:2px 6px;border-bottom:1px solid #111}
+.routes tr:hover{background:#16213e}
+.routes .active-route{color:#e94560;font-weight:bold}
+input[type=text]{background:#0f3460;color:#e0e0e0;border:1px solid #333;padding:3px 6px;border-radius:3px;font-size:12px;width:100px}
+.status{background:#111;padding:4px 8px;font-size:11px;color:#666}
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <input type="text" id="routeName" placeholder="Route name" value="My Walk">
+  <button class="btn btn-p" id="btnDraw" onclick="toggleDraw()">Draw Route</button>
+  <button class="btn btn-s" onclick="undoPoint()" id="btnUndo" disabled>Undo</button>
+  <button class="btn btn-s" onclick="clearRoute()">Clear</button>
+  <button class="btn btn-p" onclick="saveRoute()" id="btnSave" disabled>Save</button>
+  <span id="drawInfo" style="color:#8899aa"></span>
+</div>
+<div id="map"></div>
+<div class="info">
+  <span id="routeInfo">Draw a route on the map</span>
+  <span><button class="btn btn-s" onclick="loadRoutes()" style="padding:2px 8px">Refresh</button>
+  <a href="/" class="btn btn-s" style="text-decoration:none;padding:2px 8px">Back</a></span>
+</div>
+<div class="routes" id="routeList"></div>
+<div class="status" id="status">Ready</div>
+
+<script>
+let map, polyline, markers = [], latlngs = [], drawing = false;
+
+function initMap() {
+  map = L.map('map').setView([48.1486, 17.1077], 15);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'OSM'}).addTo(map);
+  polyline = L.polyline([], {color:'#e94560',weight:3}).addTo(map);
+}
+
+function toggleDraw() {
+  drawing = !drawing;
+  document.getElementById('btnDraw').textContent = drawing ? 'Stop Drawing' : 'Draw Route';
+  document.getElementById('btnDraw').className = drawing ? 'btn btn-d' : 'btn btn-p';
+  map.dragging[drawing ? 'disable' : 'enable']();
+  document.getElementById('status').textContent = drawing ? 'Click on map to add points. Click existing point to delete it.' : 'Drawing stopped.';
+}
+
+map || initMap();
+map.on('click', function(e) {
+  if (!drawing) return;
+  addPoint(e.latlng);
+});
+
+function addPoint(ll) {
+  latlngs.push(ll);
+  polyline.setLatLngs(latlngs);
+  let m = L.circleMarker(ll, {radius:4,color:'#fff',fillColor:'#e94560',fillOpacity:1,weight:1}).addTo(map);
+  m.on('click', function() {
+    if (!drawing) return;
+    let idx = markers.indexOf(m);
+    if (idx >= 0) { removePoint(idx); }
+  });
+  markers.push(m);
+  updateInfo();
+}
+
+function removePoint(idx) {
+  map.removeLayer(markers[idx]);
+  markers.splice(idx, 1);
+  latlngs.splice(idx, 1);
+  polyline.setLatLngs(latlngs);
+  updateInfo();
+}
+
+function undoPoint() {
+  if (latlngs.length === 0) return;
+  removePoint(latlngs.length - 1);
+}
+
+function clearRoute() {
+  markers.forEach(m => map.removeLayer(m));
+  markers = []; latlngs = [];
+  polyline.setLatLngs([]);
+  updateInfo();
+}
+
+function updateInfo() {
+  let dist = 0;
+  for (let i = 1; i < latlngs.length; i++) dist += latlngs[i-1].distanceTo(latlngs[i]);
+  let pts = latlngs.length;
+  document.getElementById('routeInfo').textContent = pts + ' points, ' + (dist < 1000 ? Math.round(dist) + 'm' : (dist/1000).toFixed(2) + 'km');
+  document.getElementById('btnUndo').disabled = pts === 0;
+  document.getElementById('btnSave').disabled = pts < 2;
+}
+
+// Simplify polyline (Douglas-Peucker) to max N points
+function simplify(pts, maxPts) {
+  if (pts.length <= maxPts) return pts;
+  // Simple uniform sampling as fallback
+  let step = (pts.length - 1) / (maxPts - 1);
+  let result = [];
+  for (let i = 0; i < maxPts; i++) {
+    result.push(pts[Math.round(i * step)]);
+  }
+  return result;
+}
+
+async function saveRoute() {
+  let name = document.getElementById('routeName').value.trim() || 'route';
+  if (latlngs.length < 2) return;
+
+  let pts = latlngs.map(ll => [ll.lat, ll.lng]);
+  if (pts.length > 2000) pts = simplify(pts, 2000);
+
+  document.getElementById('status').textContent = 'Saving route...';
+
+  // Step 1: Start
+  let fname = name.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 12) + '.rte';
+  let r = await fetch('/api/routes/start', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: name.substring(0, 15), filename: fname, count: pts.length})
+  });
+  let j = await r.json();
+  if (!j.ok) { document.getElementById('status').textContent = 'Error: ' + (j.error||'start failed'); return; }
+
+  // Step 2: Send points in batches of 50
+  for (let i = 0; i < pts.length; i += 50) {
+    let batch = pts.slice(i, i + 50);
+    r = await fetch('/api/routes/points', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pts: batch})
+    });
+    j = await r.json();
+    if (!j.ok) { document.getElementById('status').textContent = 'Error sending points'; return; }
+    document.getElementById('status').textContent = 'Sending... ' + Math.min(i+50, pts.length) + '/' + pts.length;
+  }
+
+  // Step 3: Finish
+  r = await fetch('/api/routes/finish', {method:'POST'});
+  j = await r.json();
+
+  document.getElementById('status').textContent = j.ok ? 'Route saved: ' + fname : 'Error finishing route';
+  loadRoutes();
+}
+
+// Load and display routes
+async function loadRoutes() {
+  try {
+    let r = await fetch('/api/routes');
+    let j = await r.json();
+    let html = '<table>';
+    if (j.routes.length === 0) html += '<tr><td colspan=4 style="color:#666">No routes</td></tr>';
+    j.routes.forEach(rt => {
+      let isActive = rt.active;
+      html += '<tr class="' + (isActive ? 'active-route' : '') + '">';
+      html += '<td>' + rt.name + '</td>';
+      html += '<td>' + rt.points + 'pts</td>';
+      html += '<td>' + (rt.distance < 1000 ? rt.distance + 'm' : (rt.distance/1000).toFixed(1) + 'km') + '</td>';
+      html += '<td>';
+      html += '<button class="btn btn-s" style="padding:1px 6px;font-size:10px" onclick="viewRoute(\'' + rt.filename + '\')">View</button> ';
+      if (!isActive) html += '<button class="btn btn-p" style="padding:1px 6px;font-size:10px" onclick="activateRoute(\'' + rt.filename + '\')">Activate</button> ';
+      html += '<button class="btn btn-d" style="padding:1px 6px;font-size:10px" onclick="deleteRoute(\'' + rt.filename + '\')">Del</button>';
+      html += '</td></tr>';
+    });
+    html += '</table>';
+    document.getElementById('routeList').innerHTML = html;
+  } catch(e) { document.getElementById('status').textContent = 'Error: ' + e.message; }
+}
+
+async function viewRoute(filename) {
+  try {
+    let r = await fetch('/api/routes/' + filename);
+    let j = await r.json();
+    if (!j.points) return;
+    // Clear current drawing
+    clearRoute();
+    drawing = false;
+    document.getElementById('btnDraw').textContent = 'Draw Route';
+    // Show on map
+    let viewPoly = L.polyline(j.points.map(p => [p[0], p[1]]), {color:'#53a8b6',weight:3}).addTo(map);
+    map.fitBounds(viewPoly.getBounds(), {padding:[20,20]});
+    document.getElementById('status').textContent = 'Viewing: ' + j.name + ' (' + j.points.length + ' pts)';
+    // Remove after 30s
+    setTimeout(() => map.removeLayer(viewPoly), 30000);
+  } catch(e) { document.getElementById('status').textContent = 'Error: ' + e.message; }
+}
+
+async function activateRoute(filename) {
+  await fetch('/api/routes/activate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename})});
+  document.getElementById('status').textContent = 'Route activated: ' + filename;
+  loadRoutes();
+}
+
+async function deleteRoute(filename) {
+  if (!confirm('Delete ' + filename + '?')) return;
+  await fetch('/api/routes/' + filename, {method:'DELETE'});
+  loadRoutes();
+}
+
+initMap();
+setTimeout(loadRoutes, 500);
+</script>
+</body>
+</html>

@@ -26,22 +26,28 @@
 #define BTN_BOOT  0
 #define BTN_USER  35  // second built-in button (input-only GPIO)
 
+// Steering wheel servo — pin defined here, functions after i2c_slave.h include
+#define SERVO_PIN  2
+
 // WiFi
 const char* WIFI_SSID = "Chewifi";
 const char* WIFI_PASS = "1236987456";
 
-// Tile config — Bratislava center (48.1486°N, 17.1077°E)
-#define TILE_ZOOM    15
-#define TILE_CX      17941
-#define TILE_CY      11373
-#define GRID         5       // 5x5 tile grid
-#define TPX          256     // tile size in pixels
-#define MAP_PX       (GRID * TPX)  // 1280
-#define GRID_X0      (TILE_CX - GRID / 2)  // 17939
-#define GRID_Y0      (TILE_CY - GRID / 2)  // 11371
+// Tile config — dynamic, scanned from SD at boot
+#define TPX 256
+int TILE_ZOOM = 15;
+int GRID_X0 = 17939, GRID_Y0 = 11371;
+int GRID_X1 = 17943, GRID_Y1 = 11375;
+int GRID_W = 5, GRID_H = 5;
+int MAP_PX_W = 1280, MAP_PX_H = 1280;
+
+// tile grid functions defined after globals (need disp2 / sdAcquire)
+void scanTileGrid();
+void saveTileGridCache();
+bool loadTileGridCache();
 
 // Static PNG buffer in BSS — doesn't touch heap, leaves room for drawPng's zlib
-static uint8_t pngBuf[42000] __attribute__((aligned(4)));
+static uint8_t pngBuf[40000] __attribute__((aligned(4)));
 
 // ─── Display 1: Built-in T-Display (VSPI) ───────────────────────────────────
 
@@ -117,7 +123,8 @@ enum D1Screen {
   D1_DASHBOARD = 0,   // speedometer gauge + throttle (implemented)
   D1_NAVIGATION,      // placeholder
   D1_MEDIA,           // placeholder
-  D1_ABOUT,           // placeholder
+  D1_IMU,             // IMU tilt visualization
+  D1_ABOUT,           // about/credits
   D1_SCREEN_COUNT
 };
 
@@ -139,7 +146,7 @@ D2Screen d2Screen = D2_NAVIGATION;
 D1Screen d1PrevScreen = D1_DASHBOARD;
 D2Screen d2PrevScreen = D2_NAVIGATION;
 
-const char* d1ScreenNames[] = {"Dashboard", "Navigation", "Media", "About"};
+const char* d1ScreenNames[] = {"Dashboard", "Navigation", "Media", "IMU", "About"};
 const char* d2ScreenNames[] = {"Navigation", "Map", "Battery", "Signal", "Media", "Debug"};
 
 // Forward declarations for sdAcquire/sdRelease (defined in web_server.h)
@@ -206,7 +213,51 @@ void checkScreenButton() {
 }
 
 #include "i2c_slave.h"
+#include "navigation.h"
 #include "web_server.h"
+
+// ─── Steering wheel servo (continuous rotation) ──────────────────────────────
+// CR servo: 1500µs = stop, <1500 = CW, >1500 = CCW
+// steer_pos 0-255 (128=center) → target ±180° (1 turn lock-to-lock)
+// Open-loop P-controller with full-speed return to center
+
+#define SERVO_SPEED_DPS  200.0f   // degrees/sec at ±500µs — calibrate this
+
+static float servoAngle = 0.0f;  // estimated current angle (degrees)
+
+void servoSetup() {
+  ledcAttach(SERVO_PIN, 50, 16);
+  ledcWrite(SERVO_PIN, 1500u * 65535u / 20000u);  // start stopped
+}
+
+void servoUpdate() {
+  static unsigned long prevMs = 0;
+  unsigned long now = millis();
+  float dt = constrain((now - prevMs) * 0.001f, 0.0f, 0.1f);
+  prevMs = now;
+
+  float target = (liveData.steer_pos - 128.0f) / 128.0f * 180.0f;
+  float err = target - servoAngle;
+
+  int us;
+  if (fabsf(err) < 2.0f) {
+    us = 1500;                                           // dead zone — stop
+    // Re-anchor: when stopped near center, reset estimate to kill drift
+    if (fabsf(target) < 5.0f) servoAngle = 0;
+  } else {
+    bool returning = fabsf(target) < fabsf(servoAngle);  // moving toward center?
+    int dev;
+    if (returning) {
+      dev = (err > 0) ? 500 : -500;                      // full speed to center
+    } else {
+      dev = (int)constrain(err * 3.0f, -500.0f, 500.0f); // proportional to turn
+    }
+    us = constrain(1500 + dev, 1000, 2000);
+    servoAngle += (dev / 500.0f) * SERVO_SPEED_DPS * dt;
+    servoAngle = constrain(servoAngle, -180.0f, 180.0f);
+  }
+  ledcWrite(SERVO_PIN, (uint32_t)us * 65535u / 20000u);
+}
 
 // Simulation
 float simX, simY, simHeading, simSpeed;
@@ -221,8 +272,8 @@ char wifiIP[20] = "";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-void getTilePath(char* buf, int tx, int ty) {
-  snprintf(buf, 40, "/tiles/%d_%d_%d.png", TILE_ZOOM, tx, ty);
+void getTilePath(char* buf, int tz, int tx, int ty) {
+  snprintf(buf, 40, "/tiles/%d_%d_%d.png", tz, tx, ty);
 }
 
 void showD1(const char* l1, const char* l2 = nullptr, const char* l3 = nullptr,
@@ -254,10 +305,10 @@ bool allTilesExist() {
   disp2.endWrite();
   digitalWrite(15, HIGH);
 
-  for (int gy = 0; gy < GRID; gy++)
-    for (int gx = 0; gx < GRID; gx++) {
+  for (int gy = 0; gy < GRID_H; gy++)
+    for (int gx = 0; gx < GRID_W; gx++) {
       char path[40];
-      getTilePath(path, GRID_X0 + gx, GRID_Y0 + gy);
+      getTilePath(path, TILE_ZOOM, GRID_X0 + gx, GRID_Y0 + gy);
       if (!SD.exists(path)) return false;
     }
   return true;
@@ -285,7 +336,7 @@ bool downloadTile(int tileX, int tileY) {
   }
 
   char path[40];
-  getTilePath(path, tileX, tileY);
+  getTilePath(path, TILE_ZOOM, tileX, tileY);
 
   // Release display bus for SD write
   disp2.endWrite();
@@ -338,17 +389,17 @@ void updateSim() {
   float ny = simY - simSpeed * cosf(simHeading);
 
   float margin = TPX;
-  if (nx < margin || nx > MAP_PX - margin) {
+  if (nx < margin || nx > MAP_PX_W - margin) {
     simHeading = -simHeading;
     nx = simX + simSpeed * sinf(simHeading);
   }
-  if (ny < margin || ny > MAP_PX - margin) {
+  if (ny < margin || ny > MAP_PX_H - margin) {
     simHeading = PI - simHeading;
     ny = simY - simSpeed * cosf(simHeading);
   }
 
-  simX = constrain(nx, margin, (float)(MAP_PX - margin));
-  simY = constrain(ny, margin, (float)(MAP_PX - margin));
+  simX = constrain(nx, margin, (float)(MAP_PX_W - margin));
+  simY = constrain(ny, margin, (float)(MAP_PX_H - margin));
 
   // Smooth speed for gauge (simulate realistic driving)
   float rawKmh = simSpeed * 4.8f * 2.5f * 3.6f;
@@ -359,11 +410,140 @@ void updateSim() {
   simThrottle += (targetThrottle - simThrottle) * 0.08f;
 }
 
+// ─── Tile grid cache ─────────────────────────────────────────────────────────
+
+#define TILE_CACHE_PATH "/tiles/grid.cfg"
+
+void saveTileGridCache() {
+  sdAcquire();
+  SD.mkdir("/tiles");
+  File f = SD.open(TILE_CACHE_PATH, FILE_WRITE);
+  if (!f) { sdRelease(); Serial.println("Cache save failed"); return; }
+  f.printf("%d %d %d %d %d\n", TILE_ZOOM, GRID_X0, GRID_Y0, GRID_X1, GRID_Y1);
+  f.close();
+  sdRelease();
+  Serial.printf("Tile grid cache saved: z=%d x=%d..%d y=%d..%d\n",
+                 TILE_ZOOM, GRID_X0, GRID_X1, GRID_Y0, GRID_Y1);
+}
+
+bool loadTileGridCache() {
+  sdAcquire();
+  if (!SD.exists(TILE_CACHE_PATH)) { sdRelease(); return false; }
+  File f = SD.open(TILE_CACHE_PATH, FILE_READ);
+  if (!f) { sdRelease(); return false; }
+  char buf[48];
+  int len = f.readBytesUntil('\n', buf, sizeof(buf) - 1);
+  buf[len] = '\0';
+  f.close();
+  sdRelease();
+
+  int z, x0, y0, x1, y1;
+  if (sscanf(buf, "%d %d %d %d %d", &z, &x0, &y0, &x1, &y1) != 5
+      || z < 1 || z > 19 || x0 < 0 || y0 < 0 || x1 < x0 || y1 < y0) {
+    Serial.println("Tile grid cache invalid");
+    return false;
+  }
+  TILE_ZOOM = z;
+  GRID_X0 = x0; GRID_Y0 = y0;
+  GRID_X1 = x1; GRID_Y1 = y1;
+  GRID_W = x1 - x0 + 1;
+  GRID_H = y1 - y0 + 1;
+  MAP_PX_W = GRID_W * TPX;
+  MAP_PX_H = GRID_H * TPX;
+  Serial.printf("Tile grid from cache: z=%d x=%d..%d y=%d..%d (%dx%d)\n",
+                 TILE_ZOOM, GRID_X0, GRID_X1, GRID_Y0, GRID_Y1, GRID_W, GRID_H);
+  return true;
+}
+
+// ─── Tile grid scanner ───────────────────────────────────────────────────────
+
+void scanTileGrid() {
+  Serial.println("Scanning tiles...");
+  disp2.endWrite(); digitalWrite(15, HIGH);
+  File dir = SD.open("/tiles");
+  if (!dir || !dir.isDirectory()) { digitalWrite(SD_CS, HIGH); return; }
+
+  int bestZ = -1, bestCount = 0;
+  int zoomCounts[20] = {0};
+
+  int fileCount = 0;
+  File f = dir.openNextFile();
+  while (f) {
+    String fn = f.name();
+    if (fileCount < 3) Serial.printf("  file: '%s'\n", fn.c_str());
+    fileCount++;
+    if (fn.endsWith(".png")) {
+      String base = fn;
+      int sl = base.lastIndexOf('/');
+      if (sl >= 0) base = base.substring(sl + 1);
+      base = base.substring(0, base.length() - 4);
+      int u1 = base.indexOf('_');
+      int u2 = base.indexOf('_', u1 + 1);
+      if (u1 > 0 && u2 > u1) {
+        int z = base.substring(0, u1).toInt();
+        if (z >= 1 && z <= 19) zoomCounts[z]++;
+      }
+    }
+    f = dir.openNextFile();
+  }
+  dir.close();
+  Serial.printf("  scanned %d files\n", fileCount);
+
+  for (int z = 1; z <= 19; z++) {
+    if (zoomCounts[z] > 0) Serial.printf("  z%d: %d tiles\n", z, zoomCounts[z]);
+    if (zoomCounts[z] > bestCount) { bestCount = zoomCounts[z]; bestZ = z; }
+  }
+  if (bestZ < 0 || bestCount == 0) {
+    Serial.println("No tiles found on SD");
+    digitalWrite(SD_CS, HIGH);
+    return;
+  }
+
+  int minX = 999999, maxX = 0, minY = 999999, maxY = 0;
+  dir = SD.open("/tiles");
+  f = dir.openNextFile();
+  while (f) {
+    String fn = f.name();
+    if (fn.endsWith(".png")) {
+      String base = fn;
+      int sl = base.lastIndexOf('/');
+      if (sl >= 0) base = base.substring(sl + 1);
+      base = base.substring(0, base.length() - 4);
+      int u1 = base.indexOf('_');
+      int u2 = base.indexOf('_', u1 + 1);
+      if (u1 > 0 && u2 > u1) {
+        int z = base.substring(0, u1).toInt();
+        int x = base.substring(u1 + 1, u2).toInt();
+        int y = base.substring(u2 + 1).toInt();
+        if (z == bestZ) {
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+      }
+    }
+    f = dir.openNextFile();
+  }
+  dir.close();
+  digitalWrite(SD_CS, HIGH);
+
+  TILE_ZOOM = bestZ;
+  GRID_X0 = minX; GRID_Y0 = minY;
+  GRID_X1 = maxX; GRID_Y1 = maxY;
+  GRID_W = maxX - minX + 1;
+  GRID_H = maxY - minY + 1;
+  MAP_PX_W = GRID_W * TPX;
+  MAP_PX_H = GRID_H * TPX;
+
+  Serial.printf("Tile grid: z=%d x=%d..%d y=%d..%d (%dx%d = %d tiles)\n",
+                 TILE_ZOOM, GRID_X0, GRID_X1, GRID_Y0, GRID_Y1, GRID_W, GRID_H, bestCount);
+  saveTileGridCache();
+}
+
 // ─── Tile drawing helper ─────────────────────────────────────────────────────
 
 void drawTile(int gx, int gy, int vpX, int vpY) {
   char path[40];
-  getTilePath(path, GRID_X0 + gx, GRID_Y0 + gy);
+  getTilePath(path, TILE_ZOOM, GRID_X0 + gx, GRID_Y0 + gy);
 
   disp2.endWrite();
   digitalWrite(15, HIGH);
@@ -388,8 +568,8 @@ void renderMap() {
   // Viewport centered on position
   int vpX = (int)simX - 86;   // 172/2
   int vpY = (int)simY - 160;  // 320/2
-  vpX = constrain(vpX, 0, MAP_PX - 172);
-  vpY = constrain(vpY, 0, MAP_PX - 320);
+  vpX = constrain(vpX, 0, MAP_PX_W - 172);
+  vpY = constrain(vpY, 0, MAP_PX_H - 320);
 
   // Visible tile range
   int tx0 = vpX / TPX, tx1 = (vpX + 171) / TPX;
@@ -402,14 +582,14 @@ void renderMap() {
   // Pass 1: draw all tiles EXCEPT the one containing the marker
   for (int ty = ty0; ty <= ty1; ty++) {
     for (int tx = tx0; tx <= tx1; tx++) {
-      if (tx == markerGx && ty == markerGy) continue;  // defer
-      if (tx < 0 || tx >= GRID || ty < 0 || ty >= GRID) continue;
+      if (tx == markerGx && ty == markerGy) continue;
+      if (tx < 0 || tx >= GRID_W || ty < 0 || ty >= GRID_H) continue;
       drawTile(tx, ty, vpX, vpY);
     }
   }
 
   // Pass 2: draw marker tile last, then marker immediately after
-  if (markerGx >= 0 && markerGx < GRID && markerGy >= 0 && markerGy < GRID) {
+  if (markerGx >= 0 && markerGx < GRID_W && markerGy >= 0 && markerGy < GRID_H) {
     drawTile(markerGx, markerGy, vpX, vpY);
   }
 
@@ -435,21 +615,28 @@ void renderMap() {
     ax + (int)(6 * sinf(simHeading + PI + ha)), ay - (int)(6 * cosf(simHeading + PI + ha)),
     TFT_RED);
 
-  // Position dot
-  disp2.fillCircle(mx, my, 6, TFT_BLUE);
-  disp2.fillCircle(mx, my, 3, TFT_WHITE);
+  // Position dot (blinks red during preview)
+  if (trackSel.previewMode && (millis() / 350) % 2) {
+    disp2.fillCircle(mx, my, 7, TFT_RED);
+    disp2.fillCircle(mx, my, 3, TFT_WHITE);
+  } else {
+    disp2.fillCircle(mx, my, 6, TFT_BLUE);
+    disp2.fillCircle(mx, my, 3, TFT_WHITE);
+  }
 
   disp2.endWrite();
 }
 
 // ─── D2 Navigation screen (map top half + nav info bottom) ──────────────────
 
+static bool navBottomInit = false;
+
 void renderD2Navigation() {
   // Top half: mini map (0..159)
   int vpX = (int)simX - 86;
   int vpY = (int)simY - 80;  // center vertically in top 160px
-  vpX = constrain(vpX, 0, MAP_PX - 172);
-  vpY = constrain(vpY, 0, MAP_PX - 160);
+  vpX = constrain(vpX, 0, MAP_PX_W - 172);
+  vpY = constrain(vpY, 0, MAP_PX_H - 160);
 
   int tx0 = vpX / TPX, tx1 = (vpX + 171) / TPX;
   int ty0 = vpY / TPX, ty1 = (vpY + 159) / TPX;
@@ -457,9 +644,9 @@ void renderD2Navigation() {
   // Draw tiles clipped to top half
   for (int ty = ty0; ty <= ty1; ty++) {
     for (int tx = tx0; tx <= tx1; tx++) {
-      if (tx < 0 || tx >= GRID || ty < 0 || ty >= GRID) continue;
+      if (tx < 0 || tx >= GRID_W || ty < 0 || ty >= GRID_H) continue;
       char path[40];
-      getTilePath(path, GRID_X0 + tx, GRID_Y0 + ty);
+      getTilePath(path, TILE_ZOOM, GRID_X0 + tx, GRID_Y0 + ty);
       disp2.endWrite();
       digitalWrite(15, HIGH);
       File f = SD.open(path, FILE_READ);
@@ -482,94 +669,85 @@ void renderD2Navigation() {
   int mx = (int)simX - vpX;
   int my = (int)simY - vpY;
   if (my >= 0 && my < 160) {
-    disp2.fillCircle(mx, my, 4, TFT_BLUE);
-    disp2.fillCircle(mx, my, 2, TFT_WHITE);
+    if (trackSel.previewMode && (millis() / 350) % 2) {
+      disp2.fillCircle(mx, my, 5, TFT_RED);
+      disp2.fillCircle(mx, my, 2, TFT_WHITE);
+    } else {
+      disp2.fillCircle(mx, my, 4, TFT_BLUE);
+      disp2.fillCircle(mx, my, 2, TFT_WHITE);
+    }
   }
 
   // ── Bottom half: navigation panel (160..319) ──
-  disp2.fillRect(0, 160, 172, 160, TFT_BLACK);
+  // Partial redraws: clear only changed areas to avoid full-screen blink
 
-  // Separator line
-  disp2.drawFastHLine(0, 160, 172, 0x4208);
+  static int8_t prevTurnDir = -99;
+  static bool prevTurnUrgent = false;
+
+  // One-time full clear on first frame or screen change
+  if (!navBottomInit) {
+    disp2.fillRect(0, 160, 172, 160, TFT_BLACK);
+    disp2.drawFastHLine(0, 160, 172, 0x4208);
+    navBottomInit = true;
+  }
 
   float hdgDeg = liveData.heading_deg;
   float kmh = liveData.speed_kmh;
+  int8_t turnDir = navRoute.active ? navRoute.nextTurnDir : 0;
+  float turnDist = navRoute.active ? navRoute.distToNextTurnM : 9999;
+  bool turnUrgent = (turnDist < 20);
 
-  // Simulated turn direction based on heading change
-  static float prevHdg = 0;
-  float hdgDelta = hdgDeg - prevHdg;
-  if (hdgDelta > 180) hdgDelta -= 360;
-  if (hdgDelta < -180) hdgDelta += 360;
-  prevHdg = hdgDeg;
-
-  // Large direction arrow
+  // Redraw arrow only when direction or urgency changes
   int arrowCx = 86, arrowCy = 210;
-  disp2.setTextSize(1);
-
-  if (abs(hdgDelta) < 2.0f) {
-    // Straight arrow
-    disp2.fillTriangle(arrowCx, arrowCy - 30, arrowCx - 15, arrowCy, arrowCx + 15, arrowCy, TFT_GREEN);
-    disp2.fillRect(arrowCx - 6, arrowCy, 12, 20, TFT_GREEN);
-    disp2.setTextColor(TFT_GREEN);
-    disp2.setCursor(48, 250);
-    disp2.setTextSize(2);
-    disp2.print("AHEAD");
-  } else if (hdgDelta > 2.0f) {
-    // Right turn arrow
-    disp2.fillTriangle(arrowCx + 30, arrowCy, arrowCx, arrowCy - 15, arrowCx, arrowCy + 15, TFT_YELLOW);
-    disp2.fillRect(arrowCx - 20, arrowCy - 6, 20, 12, TFT_YELLOW);
-    disp2.setTextColor(TFT_YELLOW);
-    disp2.setCursor(42, 250);
-    disp2.setTextSize(2);
-    disp2.print("RIGHT");
-  } else {
-    // Left turn arrow
-    disp2.fillTriangle(arrowCx - 30, arrowCy, arrowCx, arrowCy - 15, arrowCx, arrowCy + 15, TFT_YELLOW);
-    disp2.fillRect(arrowCx, arrowCy - 6, 20, 12, TFT_YELLOW);
-    disp2.setTextColor(TFT_YELLOW);
-    disp2.setCursor(48, 250);
-    disp2.setTextSize(2);
-    disp2.print("LEFT");
+  int8_t effectiveDir = (turnDir == 0 || turnDist > 50) ? 0 : turnDir;
+  if (effectiveDir != prevTurnDir || turnUrgent != prevTurnUrgent) {
+    disp2.fillRect(0, 175, 172, 90, TFT_BLACK);  // clear arrow + label area
+    if (effectiveDir == 0) {
+      uint16_t c = TFT_GREEN;
+      disp2.fillTriangle(arrowCx, arrowCy - 30, arrowCx - 15, arrowCy, arrowCx + 15, arrowCy, c);
+      disp2.fillRect(arrowCx - 6, arrowCy, 12, 20, c);
+      disp2.setTextColor(c); disp2.setCursor(48, 250); disp2.setTextSize(2); disp2.print("AHEAD");
+    } else if (effectiveDir > 0) {
+      uint16_t c = turnUrgent ? TFT_RED : TFT_YELLOW;
+      disp2.fillTriangle(arrowCx + 30, arrowCy, arrowCx, arrowCy - 15, arrowCx, arrowCy + 15, c);
+      disp2.fillRect(arrowCx - 20, arrowCy - 6, 20, 12, c);
+      disp2.setTextColor(c); disp2.setCursor(42, 250); disp2.setTextSize(2); disp2.print("RIGHT");
+    } else {
+      uint16_t c = turnUrgent ? TFT_RED : TFT_YELLOW;
+      disp2.fillTriangle(arrowCx - 30, arrowCy, arrowCx, arrowCy - 15, arrowCx, arrowCy + 15, c);
+      disp2.fillRect(arrowCx, arrowCy - 6, 20, 12, c);
+      disp2.setTextColor(c); disp2.setCursor(48, 250); disp2.setTextSize(2); disp2.print("LEFT");
+    }
+    prevTurnDir = effectiveDir;
+    prevTurnUrgent = turnUrgent;
   }
 
-  // Distance info
-  static float simDist = 0;
-  simDist += kmh / 3600.0f * 0.4f;  // accumulate distance
-
+  // Text rows — clear and redraw each row (narrow strips, minimal flash)
   disp2.setTextSize(1);
-  disp2.setTextColor(TFT_WHITE);
-  disp2.setCursor(8, 170);
-  disp2.printf("DIST: %.1f km", simDist);
 
-  // Next turn distance (simulated)
-  float nextTurn = 0.2f + sinf(millis() * 0.0003f) * 0.15f;
+  // Row 1: route remaining + speed
+  disp2.fillRect(0, 168, 172, 10, TFT_BLACK);
+  disp2.setTextColor(TFT_WHITE); disp2.setCursor(8, 170);
+  if (navRoute.active) disp2.printf("REM: %.0fm", navRoute.remainingDistM);
+  else disp2.print("No route");
+  disp2.setCursor(100, 170); disp2.setTextColor(TFT_GREEN); disp2.printf("%.0f", kmh);
+  disp2.setTextColor(0xC618); disp2.print(" km/h");
+
+  // Row 2: turn distance + heading
+  disp2.fillRect(0, 182, 172, 10, TFT_BLACK);
   disp2.setCursor(8, 184);
-  disp2.printf("NEXT: %d m", (int)(nextTurn * 1000));
+  if (navRoute.active && turnDir != 0) { disp2.setTextColor(TFT_WHITE); disp2.printf("TURN: %.0fm", turnDist); }
+  else { disp2.setTextColor(0x8410); disp2.print("No turn ahead"); }
+  disp2.setCursor(100, 184); disp2.setTextColor(0x8C71); disp2.printf("HDG %.0f%c", hdgDeg, (char)247);
 
-  // Speed
-  disp2.setCursor(100, 170);
-  disp2.setTextColor(TFT_GREEN);
-  disp2.printf("%.0f", kmh);
-  disp2.setTextColor(0xC618);
-  disp2.print(" km/h");
-
-  // Heading
-  disp2.setCursor(100, 184);
-  disp2.setTextColor(0x8C71);
-  disp2.printf("HDG %.0f%c", hdgDeg, (char)247);
-
-  // ETA
-  disp2.setCursor(8, 300);
-  disp2.setTextColor(0xC618);
+  // Bottom row: ETA + coordinates
+  disp2.fillRect(0, 298, 172, 10, TFT_BLACK);
+  disp2.setCursor(8, 300); disp2.setTextColor(0xC618);
   int eta = 15 + (int)(sinf(millis() * 0.0001f) * 5);
   disp2.printf("ETA: %d min", eta);
-
-  // Coordinates
   float lat, lon;
   pixelToLatLon(simX, simY, &lat, &lon);
-  disp2.setCursor(80, 300);
-  disp2.setTextColor(0x8C71);
-  disp2.printf("%.4fN", lat);
+  disp2.setCursor(80, 300); disp2.setTextColor(0x8C71); disp2.printf("%.4fN", lat);
 
   disp2.endWrite();
 }
@@ -809,11 +987,8 @@ void renderD1Navigation() {
 
   // Layout: [Speed+Throttle 30px] [Nav Arrow 75px] [Compass 135px]
   float hdgDeg = liveData.heading_deg;
-  static float prevNavHdg = 0;
-  float hdgDelta = hdgDeg - prevNavHdg;
-  if (hdgDelta > 180) hdgDelta -= 360;
-  if (hdgDelta < -180) hdgDelta += 360;
-  prevNavHdg = hdgDeg;
+  int8_t turnDir = navRoute.active ? navRoute.nextTurnDir : 0;
+  float turnDist = navRoute.active ? navRoute.distToNextTurnM : 9999;
 
   // ── Left strip: Speed + vertical throttle bar (0..29) ──
 
@@ -848,7 +1023,7 @@ void renderD1Navigation() {
   // ── Center: Navigation arrow (30..104) with padding ──
   int ax = 68, ay = 56;
 
-  if (fabsf(hdgDelta) < 2.0f) {
+  if (turnDir == 0 || turnDist > 50) {
     // Straight
     sprite1.fillTriangle(ax, ay - 35, ax - 18, ay + 5, ax + 18, ay + 5, TFT_GREEN);
     sprite1.fillRect(ax - 8, ay + 5, 16, 24, TFT_GREEN);
@@ -856,30 +1031,35 @@ void renderD1Navigation() {
     sprite1.setTextSize(1);
     sprite1.setCursor(46, 100);
     sprite1.print("AHEAD");
-  } else if (hdgDelta > 2.0f) {
+  } else if (turnDir > 0) {
     // Right
-    sprite1.fillTriangle(ax + 32, ay, ax - 2, ay - 18, ax - 2, ay + 18, TFT_YELLOW);
-    sprite1.fillRect(ax - 24, ay - 8, 22, 16, TFT_YELLOW);
-    sprite1.setTextColor(TFT_YELLOW);
+    uint16_t col = (turnDist < 20) ? TFT_RED : TFT_YELLOW;
+    sprite1.fillTriangle(ax + 32, ay, ax - 2, ay - 18, ax - 2, ay + 18, col);
+    sprite1.fillRect(ax - 24, ay - 8, 22, 16, col);
+    sprite1.setTextColor(col);
     sprite1.setTextSize(1);
     sprite1.setCursor(46, 100);
     sprite1.print("RIGHT");
   } else {
     // Left
-    sprite1.fillTriangle(ax - 32, ay, ax + 2, ay - 18, ax + 2, ay + 18, TFT_YELLOW);
-    sprite1.fillRect(ax + 2, ay - 8, 22, 16, TFT_YELLOW);
-    sprite1.setTextColor(TFT_YELLOW);
+    uint16_t col = (turnDist < 20) ? TFT_RED : TFT_YELLOW;
+    sprite1.fillTriangle(ax - 32, ay, ax + 2, ay - 18, ax + 2, ay + 18, col);
+    sprite1.fillRect(ax + 2, ay - 8, 22, 16, col);
+    sprite1.setTextColor(col);
     sprite1.setTextSize(1);
     sprite1.setCursor(50, 100);
     sprite1.print("LEFT");
   }
 
-  // Next turn distance
-  float nextTurn = 0.2f + sinf(millis() * 0.0003f) * 0.15f;
+  // Turn distance from route engine
   sprite1.setTextColor(TFT_WHITE);
   sprite1.setTextSize(1);
-  sprite1.setCursor(44, 115);
-  sprite1.printf("%dm", (int)(nextTurn * 1000));
+  sprite1.setCursor(36, 115);
+  if (navRoute.active && turnDir != 0) {
+    sprite1.printf("%.0fm", turnDist);
+  } else if (navRoute.active) {
+    sprite1.printf("%.0fm left", navRoute.remainingDistM);
+  }
 
   // ── Right: Compass (105..239) ──
   int cx = 172, cy = 67, cr = 56;
@@ -1158,6 +1338,324 @@ void renderD1About() {
     }
     sprite1.print(line);
   }
+
+  sprite1.pushSprite(0, 0);
+}
+
+// ─── D1 IMU tilt visualization ──────────────────────────────────────────────
+
+// Helper: draw a filled quad from 4 points
+static void fillQuad(LGFX_Sprite& s, int x0,int y0, int x1,int y1,
+                     int x2,int y2, int x3,int y3, uint16_t c) {
+  s.fillTriangle(x0,y0,x1,y1,x2,y2, c);
+  s.fillTriangle(x1,y1,x2,y2,x3,y3, c);
+}
+
+// Draw rear view of monster truck, centered at (cx,cy), rotated by roll angle
+static void drawTruckRear(LGFX_Sprite& s, int cx, int cy, float ang) {
+  float sr = sinf(ang), cr = cosf(ang);
+  #define R(px,py,ox,oy) ox=cx+(int)((px)*cr-(py)*sr); oy=cy+(int)((px)*sr+(py)*cr)
+  int _x0,_y0,_x1,_y1,_x2,_y2,_x3,_y3;
+
+  // ── Ground ──
+  R(-52, 28, _x0, _y0); R(52, 28, _x1, _y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x18C3);
+
+  // ── Tires (rectangular from behind — we see the tread face) ──
+  int wS = 24, wY = 16;  // wheel spread, wheel center Y
+  int wW = 10, wH = 20;  // tire width and height as seen from rear
+  for (int side = -1; side <= 1; side += 2) {
+    // Tire rectangle corners
+    int _a,_b,_c,_d,_e,_f,_g,_h;
+    R(side*wS - wW/2, wY - wH/2, _a, _b);
+    R(side*wS + wW/2, wY - wH/2, _c, _d);
+    R(side*wS + wW/2, wY + wH/2, _e, _f);
+    R(side*wS - wW/2, wY + wH/2, _g, _h);
+    // Outer tire (dark)
+    fillQuad(s, _a,_b, _c,_d, _e,_f, _g,_h, 0x2945);
+    // Tread pattern — horizontal lines across tire face
+    for (int t = -3; t <= 3; t++) {
+      R(side*wS - wW/2+1, wY + t*3, _x0,_y0);
+      R(side*wS + wW/2-1, wY + t*3, _x1,_y1);
+      s.drawLine(_x0,_y0,_x1,_y1, 0x39C7);
+    }
+    // Tire outline
+    s.drawLine(_a,_b,_c,_d, 0x4A69);
+    s.drawLine(_c,_d,_e,_f, 0x4A69);
+    s.drawLine(_e,_f,_g,_h, 0x4A69);
+    s.drawLine(_g,_h,_a,_b, 0x4A69);
+    // Hub cap (small circle in center)
+    int hx,hy; R(side*wS, wY, hx, hy);
+    s.fillCircle(hx,hy, 3, 0x6B6D);
+    s.drawCircle(hx,hy, 3, 0x8410);
+    s.fillCircle(hx,hy, 1, 0xAD75);
+  }
+
+  // ── Axle (connecting wheels) ──
+  R(-wS, wY, _x0,_y0); R(wS, wY, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x4A69);
+
+  // ── Suspension arms ──
+  R(-wS, wY-wH/2+2, _x0,_y0); R(-16, 0, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x6B6D);
+  s.drawLine(_x0+1,_y0,_x1+1,_y1, 0x4A69);
+  R(wS, wY-wH/2+2, _x0,_y0); R(16, 0, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x6B6D);
+  s.drawLine(_x0-1,_y0,_x1-1,_y1, 0x4A69);
+  // Shocks
+  R(-wS+3, wY-wH/2, _x0,_y0); R(-12, -8, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x8410);
+  R(wS-3, wY-wH/2, _x0,_y0); R(12, -8, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x8410);
+
+  // ── Body/bed (wide rectangle) ──
+  R(-22, 1, _x0,_y0); R(22, 1, _x1,_y1);
+  R(-24, -7, _x2,_y2); R(24, -7, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x1928);
+  // Fender flares (arches over wheels)
+  R(-26, 0, _x0,_y0); R(-22, 1, _x1,_y1);
+  R(-28, -7, _x2,_y2); R(-24, -7, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x18E3);
+  R(22, 1, _x0,_y0); R(26, 0, _x1,_y1);
+  R(24, -7, _x2,_y2); R(28, -7, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x18E3);
+  // Body outline
+  R(-28, -7, _x0,_y0); R(28, -7, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x528A);
+
+  // ── Cab (symmetric from rear) ──
+  R(-18, -7, _x0,_y0); R(18, -7, _x1,_y1);
+  R(-14, -24, _x2,_y2); R(14, -24, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x1928);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x528A);
+  s.drawLine(_x0,_y0,_x2,_y2, 0x528A);
+  s.drawLine(_x1,_y1,_x3,_y3, 0x528A);
+  s.drawLine(_x2,_y2,_x3,_y3, 0x528A);
+
+  // ── Rear window (symmetric rectangle) ──
+  R(-12, -9, _x0,_y0); R(12, -9, _x1,_y1);
+  R(-10, -21, _x2,_y2); R(10, -21, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x0010);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x2945);
+  s.drawLine(_x2,_y2,_x3,_y3, 0x2945);
+  s.drawLine(_x0,_y0,_x2,_y2, 0x2945);
+  s.drawLine(_x1,_y1,_x3,_y3, 0x2945);
+  // Center divider
+  R(0, -9, _x0,_y0); R(0, -21, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x2945);
+
+  // ── Roof + light bar ──
+  R(-14, -24, _x0,_y0); R(14, -24, _x1,_y1);
+  R(-15, -26, _x2,_y2); R(15, -26, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x2104);
+  for (int i = -2; i <= 2; i++) {
+    int lx,ly; R(i*6, -27, lx, ly);
+    uint16_t lc = liveData.light_mode >= 2 ? TFT_YELLOW : 0x3186;
+    s.fillRect(lx-1, ly-1, 3, 2, lc);
+  }
+
+  // ── Tail lights (symmetric, on body sides) ──
+  R(-23, -4, _x0,_y0); s.fillRect(_x0-1,_y0-2, 3,4, TFT_RED);
+  R( 23, -4, _x0,_y0); s.fillRect(_x0-1,_y0-2, 3,4, TFT_RED);
+
+  // ── License plate area ──
+  R(-6, -1, _x0,_y0); R(6, -1, _x1,_y1);
+  R(-6, -5, _x2,_y2); R(6, -5, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x4208);
+
+  #undef R
+}
+
+// Draw side view of monster truck (front faces LEFT), centered at (cx,cy)
+static void drawTruckSide(LGFX_Sprite& s, int cx, int cy, float ang) {
+  float sr = sinf(ang), cr = cosf(ang);
+  // Note: X coords are negated vs old version to flip horizontally (front=left)
+  #define R(px,py,ox,oy) ox=cx+(int)(-(px)*cr-(py)*sr); oy=cy+(int)(-(px)*sr+(py)*cr)
+  int _x0,_y0,_x1,_y1,_x2,_y2,_x3,_y3;
+
+  // ── Ground ──
+  R(-55, 28, _x0, _y0); R(55, 28, _x1, _y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x18C3);
+
+  // ── Wheels (front & rear, round from side) ──
+  int wR = 12, wY = 16;
+  int fwx,fwy,rwx,rwy;
+  R(-26, wY, rwx, rwy);  // rear
+  R( 26, wY, fwx, fwy);  // front
+  for (int w = 0; w < 2; w++) {
+    int wx = w ? fwx : rwx, wy = w ? fwy : rwy;
+    s.fillCircle(wx,wy, wR, 0x2945);
+    s.drawCircle(wx,wy, wR, 0x4A69);
+    s.drawCircle(wx,wy, wR-1, 0x39C7);
+    s.fillCircle(wx,wy, wR-3, 0x2104);
+    // Rim spokes
+    s.drawCircle(wx,wy, 5, 0x8410);
+    s.fillCircle(wx,wy, 3, 0x6B6D);
+    s.fillCircle(wx,wy, 1, 0xAD75);
+  }
+
+  // ── Wheel fenders (arcs above wheels) ──
+  // Rear fender
+  R(-26, wY-wR-1, _x0,_y0); R(-36, wY-4, _x1,_y1);
+  R(-16, wY-4, _x2,_y2);
+  s.drawLine(_x1,_y1,_x0,_y0, 0x528A);
+  s.drawLine(_x0,_y0,_x2,_y2, 0x528A);
+  // Rear fender fill
+  R(-36, wY-4, _x0,_y0); R(-16, wY-4, _x1,_y1);
+  R(-34, wY-8, _x2,_y2); R(-18, wY-8, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x18E3);
+  // Front fender
+  R(26, wY-wR-1, _x0,_y0); R(16, wY-4, _x1,_y1);
+  R(36, wY-4, _x2,_y2);
+  s.drawLine(_x1,_y1,_x0,_y0, 0x528A);
+  s.drawLine(_x0,_y0,_x2,_y2, 0x528A);
+  R(16, wY-4, _x0,_y0); R(36, wY-4, _x1,_y1);
+  R(18, wY-8, _x2,_y2); R(34, wY-8, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x18E3);
+
+  // ── Suspension ──
+  R(-26, wY-wR+3, _x0,_y0); R(-20, 0, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x6B6D);
+  R(26, wY-wR+3, _x0,_y0); R(20, 0, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x6B6D);
+  // Shocks
+  R(-22, wY-wR, _x0,_y0); R(-14, -8, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x8410);
+  R(22, wY-wR, _x0,_y0); R(14, -8, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x8410);
+
+  // ── Chassis rail ──
+  R(-32, 1, _x0,_y0); R(30, 1, _x1,_y1);
+  R(-32, -3, _x2,_y2); R(30, -3, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x10A2);
+
+  // ── Rear bed (front=left, so bed is on RIGHT side now) ──
+  R(-36, -3, _x0,_y0); R(-8, -3, _x1,_y1);
+  R(-34, -10, _x2,_y2); R(-8, -10, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x1928);
+  s.drawLine(_x0,_y0,_x2,_y2, 0x528A);
+  s.drawLine(_x2,_y2,_x3,_y3, 0x528A);
+
+  // ── Cab ──
+  R(-8, -3, _x0,_y0); R(28, -3, _x1,_y1);
+  R(-8, -22, _x2,_y2); R(22, -22, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x1928);
+  s.drawLine(_x0,_y0,_x2,_y2, 0x528A);
+  s.drawLine(_x2,_y2,_x3,_y3, 0x528A);
+  // Windshield slope
+  R(28, -3, _x0,_y0); R(22, -22, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x528A);
+
+  // ── Side window ──
+  R(-5, -8, _x0,_y0); R(16, -8, _x1,_y1);
+  R(-3, -20, _x2,_y2); R(14, -20, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x0010);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x2945);
+  s.drawLine(_x2,_y2,_x3,_y3, 0x2945);
+  s.drawLine(_x0,_y0,_x2,_y2, 0x2945);
+  s.drawLine(_x1,_y1,_x3,_y3, 0x2945);
+  // Door line
+  R(4, -7, _x0,_y0); R(4, -2, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x39C7);
+
+  // ── Roof ──
+  R(-9, -22, _x0,_y0); R(22, -22, _x1,_y1);
+  R(-10, -24, _x2,_y2); R(22, -24, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x2104);
+
+  // ── Bumpers ──
+  R(30, -1, _x0,_y0); R(36, -1, _x1,_y1);
+  R(30, -5, _x2,_y2); R(36, -5, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x4208);
+  R(-36, -1, _x0,_y0); R(-34, -1, _x1,_y1);
+  R(-36, -5, _x2,_y2); R(-34, -5, _x3,_y3);
+  fillQuad(s, _x0,_y0,_x1,_y1,_x3,_y3,_x2,_y2, 0x4208);
+
+  // ── Lights (NOT flipped — keep correct orientation) ──
+  // Headlight on front (left side of screen since front=left)
+  // Use original (non-negated) coords for lights
+  #undef R
+  #define R2(px,py,ox,oy) ox=cx+(int)((px)*cr-(py)*sr); oy=cy+(int)((px)*sr+(py)*cr)
+  R2(-34, -5, _x0,_y0);  // front-left = headlight
+  s.fillCircle(_x0,_y0, 2, TFT_RED);
+  R2(35, -5, _x0,_y0);   // rear-right = tail light
+  s.fillCircle(_x0,_y0, 2, liveData.light_mode >= 2 ? TFT_YELLOW : 0x4208);
+  #undef R2
+
+  // ── Exhaust (rear side, now on right) ──
+  #define R(px,py,ox,oy) ox=cx+(int)(-(px)*cr-(py)*sr); oy=cy+(int)(-(px)*sr+(py)*cr)
+  R(-32, 3, _x0,_y0); R(-38, 5, _x1,_y1);
+  s.drawLine(_x0,_y0,_x1,_y1, 0x6B6D);
+
+  #undef R
+}
+
+void renderD1IMU() {
+  sprite1.fillScreen(TFT_BLACK);
+
+  // ── Left strip: Speed + vertical throttle ──
+  sprite1.setTextColor(TFT_WHITE);
+  sprite1.setTextSize(2);
+  int spdVal = (int)liveData.speed_kmh;
+  sprite1.setCursor(spdVal < 10 ? 6 : 0, 4);
+  sprite1.printf("%d", spdVal);
+  sprite1.setTextSize(1);
+  sprite1.setTextColor(0x6B6D);
+  sprite1.setCursor(4, 22);
+  sprite1.print("km/h");
+
+  int tbX = 6, tbY = 34, tbW = 14, tbH = 76;
+  sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
+  int fillH = (int)(liveData.throttle_pct / 100.0f * (tbH - 2));
+  for (int y = 0; y < fillH; y++) {
+    float f = (float)y / (tbH - 2);
+    uint8_t r = (f < 0.5f) ? (uint8_t)(f * 2 * 200) : 200;
+    uint8_t g = (f < 0.5f) ? 200 : (uint8_t)((1.0f - f) * 2 * 200);
+    sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+  }
+  sprite1.setTextColor(0x6B6D);
+  sprite1.setCursor(2, tbY + tbH + 2);
+  sprite1.printf("%d%%", (int)liveData.throttle_pct);
+
+  sprite1.drawFastVLine(27, 0, 135, 0x2104);
+
+  // ── IMU values ──
+  float roll  = constrain(liveData.accel_x, -1.0f, 1.0f);
+  float pitch = constrain(liveData.accel_y, -1.0f, 1.0f);
+  float rollAng  = roll  * 0.52f;   // max ±30°
+  float pitchAng = pitch * 0.52f;
+
+  // ── Labels ──
+  sprite1.setTextSize(1);
+  sprite1.setTextColor(0x4A69);
+  sprite1.setCursor(50, 1);  sprite1.print("REAR");
+  sprite1.setCursor(155, 1); sprite1.print("SIDE");
+
+  // ── Divider ──
+  sprite1.drawFastVLine(132, 0, 112, 0x18C3);
+
+  // ── Rear view (roll tilt) — left panel ──
+  drawTruckRear(sprite1, 80, 55, rollAng);
+
+  // ── Side view (pitch tilt) — right panel ──
+  drawTruckSide(sprite1, 186, 55, pitchAng);
+
+  // ── Bottom 2 lines: IMU text data (indented past left column) ──
+  int tx = 30;
+  sprite1.drawFastHLine(tx, 113, 240 - tx, 0x2104);
+  sprite1.setTextSize(1);
+  char buf[48];
+
+  sprite1.setTextColor(0x8410);
+  sprite1.setCursor(tx, 117);
+  snprintf(buf, sizeof(buf), "R%+.1f P%+.1f Y%+.1f%c/s",
+           liveData.accel_x, liveData.accel_y, liveData.gyro_z, (char)247);
+  sprite1.print(buf);
+
+  sprite1.setCursor(tx, 127);
+  snprintf(buf, sizeof(buf), "Z%+.1fg T%.0f%cC %.0fPa",
+           liveData.accel_z, liveData.temperature, (char)247, liveData.pressure_pa);
+  sprite1.print(buf);
 
   sprite1.pushSprite(0, 0);
 }
@@ -1754,11 +2252,18 @@ void renderD1() {
     d1PrevScreen = d1Screen;
   }
 
+  // Track selection takes over D1 when active
+  if (trackSel.active) {
+    renderD1TrackSelection();
+    return;
+  }
+
   switch (d1Screen) {
     case D1_DASHBOARD:   renderNavInfo(); break;
     case D1_NAVIGATION:  renderD1Navigation(); break;
     case D1_MEDIA:       renderD1Media(); break;
     case D1_ABOUT:       renderD1About(); break;
+    case D1_IMU:         renderD1IMU(); break;
     default: break;
   }
 }
@@ -1769,6 +2274,7 @@ void renderD2() {
     disp2.startWrite();
     disp2.fillScreen(TFT_BLACK);
     disp2.endWrite();
+    navBottomInit = false;
     battDrawn = false;
     sigBattDrawn = false;
     mediaDrawn = false;
@@ -1803,17 +2309,24 @@ void processOneWebDownload() {
   if (exists) {
     Serial.printf("Web DL skip: %s\n", dlJob.current);
   } else {
-    Serial.printf("Web DL: %s\n", dlJob.current);
+    Serial.printf("Web DL: %s (heap=%d, largest=%d)\n", dlJob.current,
+                   ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     char url[128];
     snprintf(url, sizeof(url), "https://tile.openstreetmap.org/%d/%d/%d.png",
              dlJob.z, dlJob.curX, dlJob.curY);
 
-    WiFiClientSecure *client = new WiFiClientSecure;
-    client->setInsecure();
+    // Free sprite1 temporarily for SSL buffer space
+    sprite1.deleteSprite();
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10);
+
     HTTPClient http;
-    http.begin(*client, url);
+    http.begin(client, url);
     http.addHeader("User-Agent", "ESP32-NavDemo/1.0 (hobby)");
     http.setTimeout(10000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     int code = http.GET();
 
     if (code == 200) {
@@ -1824,26 +2337,34 @@ void processOneWebDownload() {
         WiFiClient* stream = http.getStreamPtr();
         uint8_t buf[512];
         int written = 0;
-        while (http.connected() && (written < total || total == -1)) {
+        unsigned long dlTimeout = millis() + 15000;
+        while (http.connected() && millis() < dlTimeout) {
           int avail = stream->available();
           if (avail > 0) {
             int len = stream->readBytes(buf, min((int)sizeof(buf), avail));
             f.write(buf, len);
             written += len;
+            if (total > 0 && written >= total) break;
           } else if (total > 0 && written >= total) break;
-          else delay(1);
+          else { webServer.handleClient(); delay(1); }
         }
         f.close();
         Serial.printf("  saved %d bytes\n", written);
       }
       sdRelease();
     } else {
-      Serial.printf("  HTTP %d\n", code);
+      Serial.printf("  HTTP %d (heap=%d)\n", code, ESP.getFreeHeap());
       dlJob.errors++;
     }
     http.end();
-    delete client;
-    delay(600);  // OSM rate limit
+
+    // Recreate sprite1 after SSL freed
+    if (!sprite1.getBuffer()) {
+      sprite1.setColorDepth(16);
+      sprite1.createSprite(240, 135);
+    }
+    // OSM rate limit — keep web server responsive during the wait
+    { unsigned long until = millis() + 600; while (millis() < until) { webServer.handleClient(); delay(10); } }
   }
 
   dlJob.done++;
@@ -1855,6 +2376,7 @@ void processOneWebDownload() {
   if (dlJob.curY > dlJob.y1 || dlJob.cancel) {
     dlJob.active = false;
     Serial.printf("Web DL done: %d/%d, %d errors\n", dlJob.done, dlJob.total, dlJob.errors);
+    if (!dlJob.cancel) scanTileGrid();  // update grid bounds + save cache
   }
 }
 
@@ -1977,6 +2499,63 @@ void bootAnimation() {
   disp2.endWrite();
 }
 
+// ─── Serial command processor (for testing) ─────────────────────────────────
+// Commands:
+//   ts        - enter track selection mode
+//   te        - exit track selection mode
+//   tn        - next track
+//   tp        - previous track
+//   tc        - confirm/select track
+//   ns        - start/restart navigation
+//   np        - preview selected track
+//   d1 <n>    - switch D1 screen (0-3)
+//   d2 <n>    - switch D2 screen (0-5)
+
+void processSerialCommands() {
+  if (!Serial.available()) return;
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  Serial.printf("> %s\n", cmd.c_str());
+
+  if (cmd == "ts") {
+    enterTrackSelection();
+  } else if (cmd == "te") {
+    exitTrackSelection();
+  } else if (cmd == "tn") {
+    trackSelectNext();
+  } else if (cmd == "tp") {
+    trackSelectPrev();
+  } else if (cmd == "tc") {
+    trackConfirmSelection();
+  } else if (cmd == "ns") {
+    startNavigation();
+  } else if (cmd == "np") {
+    if (trackSel.previewMode) stopPreview();
+    else startPreview();
+  } else if (cmd.startsWith("d1 ")) {
+    int scr = cmd.substring(3).toInt();
+    if (scr >= 0 && scr < D1_SCREEN_COUNT) {
+      d1Screen = (D1Screen)scr;
+      saveScreenState();
+      Serial.printf("D1 -> %s\n", d1ScreenNames[scr]);
+    }
+  } else if (cmd.startsWith("d2 ")) {
+    int scr = cmd.substring(3).toInt();
+    if (scr >= 0 && scr < D2_SCREEN_COUNT) {
+      d2Screen = (D2Screen)scr;
+      saveScreenState();
+      Serial.printf("D2 -> %s\n", d2ScreenNames[scr]);
+    }
+  } else if (cmd == "help") {
+    Serial.println("Commands: ts te tn tp tc ns np d1<n> d2<n> help");
+  } else {
+    Serial.printf("Unknown: %s (type 'help')\n", cmd.c_str());
+  }
+}
+
 // ─── Setup ───────────────────────────────────────────────────────────────────
 
 void setup() {
@@ -2035,12 +2614,16 @@ void setup() {
   }
 
   SD.mkdir("/tiles");
+  SD.mkdir("/routes");
   loadScreenState();
   setupI2CSlave();
+  servoSetup();
+  loadActiveRoute();
 
-  // Init simulation
-  simX = MAP_PX / 2.0f;
-  simY = MAP_PX / 2.0f;
+  // Init simulation — load grid from cache, fall back to full scan
+  if (!loadTileGridCache()) scanTileGrid();
+  simX = MAP_PX_W / 2.0f;
+  simY = MAP_PX_H / 2.0f;
   simHeading = 0.5f;
   simSpeed = 2.0f;
   randomSeed(analogRead(0));
@@ -2116,14 +2699,49 @@ void loop() {
     checkScreenButton();
     parseI2CMessage();
     checkI2CTimeout();
+    processSerialCommands();
+
+    // Track selection via I2C steering/throttle
+    if (trackSel.active && liveData.masterPresent) {
+      static unsigned long lastSteerAction = 0;
+      static bool throttleWasHigh = false;
+      // Steer left (< 80) / right (> 175) to browse tracks
+      if (millis() - lastSteerAction > 400) {
+        if (liveData.steer_pos < 80) { trackSelectPrev(); lastSteerAction = millis(); }
+        else if (liveData.steer_pos > 175) { trackSelectNext(); lastSteerAction = millis(); }
+      }
+      // Throttle to full (>90%) then back to 0 (<10%) to confirm
+      if (liveData.throttle_pct > 90) throttleWasHigh = true;
+      if (throttleWasHigh && liveData.throttle_pct < 10) {
+        throttleWasHigh = false;
+        trackConfirmSelection();
+      }
+    }
+
     updateSim();
     updateMediaState();
+
+    // Navigation update at 2Hz
+    { static unsigned long lastNavUpdate = 0;
+      if (millis() - lastNavUpdate > 500) {
+        lastNavUpdate = millis();
+        int32_t gpsLat = (int32_t)(liveData.latitude * 1e7);
+        int32_t gpsLon = (int32_t)(liveData.longitude * 1e7);
+        updateNavigation(gpsLat, gpsLon);
+      }
+    }
 
     // Populate LiveData: from I2C master if present, otherwise from simulation
     if (!liveData.masterPresent) {
       updateLiveDataFromSim();
     }
 
+    // Preview overrides liveData position/heading AFTER sim (takes priority)
+    if (trackSel.previewMode) {
+      updatePreview();
+    }
+
+    servoUpdate();
     renderD2();
     renderD1();
     break;

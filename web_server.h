@@ -22,6 +22,7 @@ DownloadJob dlJob;
 // Forward declarations
 extern LGFX_Waveshare disp2;
 extern SPIClass hspi;
+extern void scanTileGrid();
 
 // Helper: release display bus for SD access
 void sdAcquire() {
@@ -42,11 +43,15 @@ void handleRoot() {
 
 void handleListTiles() {
   sdAcquire();
-
-  String json = "{\"tiles\":[";
   File dir = SD.open("/tiles");
+
+  // Stream chunked response — avoids building a huge String in RAM
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "application/json", "");
+  webServer.sendContent("{\"tiles\":[");
+
   int count = 0;
-  size_t totalBytes = 0;
+  uint32_t totalBytes = 0;
   bool first = true;
 
   if (dir && dir.isDirectory()) {
@@ -55,20 +60,21 @@ void handleListTiles() {
       String name = f.name();
       if (name.endsWith(".png")) {
         String base = name;
-        // Remove path prefix if present
         int lastSlash = base.lastIndexOf('/');
         if (lastSlash >= 0) base = base.substring(lastSlash + 1);
-        base = base.substring(0, base.length() - 4);  // remove .png
+        base = base.substring(0, base.length() - 4);
         int u1 = base.indexOf('_');
         int u2 = base.indexOf('_', u1 + 1);
         if (u1 > 0 && u2 > u1) {
           int z = base.substring(0, u1).toInt();
           int x = base.substring(u1 + 1, u2).toInt();
           int y = base.substring(u2 + 1).toInt();
-          size_t sz = f.size();
+          uint32_t sz = f.size();
           totalBytes += sz;
-          if (!first) json += ",";
-          json += "{\"z\":" + String(z) + ",\"x\":" + String(x) + ",\"y\":" + String(y) + ",\"size\":" + String(sz) + "}";
+          char entry[80];
+          snprintf(entry, sizeof(entry), "%s{\"z\":%d,\"x\":%d,\"y\":%d,\"size\":%u}",
+                   first ? "" : ",", z, x, y, (unsigned)sz);
+          webServer.sendContent(entry);
           first = false;
           count++;
         }
@@ -77,10 +83,12 @@ void handleListTiles() {
     }
     dir.close();
   }
-
   sdRelease();
-  json += "],\"total_count\":" + String(count) + ",\"total_bytes\":" + String(totalBytes) + "}";
-  webServer.send(200, "application/json", json);
+
+  char tail[64];
+  snprintf(tail, sizeof(tail), "],\"total_count\":%d,\"total_bytes\":%u}", count, (unsigned)totalBytes);
+  webServer.sendContent(tail);
+  webServer.sendContent("");  // end chunked transfer
 }
 
 void handleDeleteTile() {
@@ -93,8 +101,8 @@ void handleDeleteTile() {
   sdAcquire();
   bool ok = SD.remove(path);
   sdRelease();
-
   webServer.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"not found\"}");
+  if (ok) scanTileGrid();  // update grid bounds + save cache (response already sent)
 }
 
 void handleDeleteAll() {
@@ -121,6 +129,7 @@ void handleDeleteAll() {
 
   sdRelease();
   webServer.send(200, "application/json", "{\"ok\":true,\"deleted\":" + String(deleted) + "}");
+  scanTileGrid();  // update grid bounds + save cache (response already sent)
 }
 
 void handleStartDownload() {
@@ -245,11 +254,259 @@ void handleSetScreen() {
   }
 }
 
+// ─── Route API ───────────────────────────────────────────────────────────────
+
+extern NavRoute navRoute;
+extern bool loadRoute(const char* filename);
+extern void setActiveRoute(const char* filename);
+
+// Chunked upload state
+static File routeUploadFile;
+static char routeUploadFilename[32] = "";
+static char routeUploadName[16] = "";
+static uint16_t routeUploadCount = 0;
+static uint16_t routeUploadReceived = 0;
+
+void handleRouteList() {
+  sdAcquire();
+  // Read active route name
+  char activeName[32] = "";
+  if (SD.exists("/routes/active.cfg")) {
+    File af = SD.open("/routes/active.cfg", FILE_READ);
+    if (af) { int l = af.readBytesUntil('\n', activeName, 31); activeName[l] = '\0'; af.close(); }
+  }
+
+  String json = "{\"routes\":[";
+  File dir = SD.open("/routes");
+  bool first = true;
+  if (dir && dir.isDirectory()) {
+    File f = dir.openNextFile();
+    while (f) {
+      String fn = f.name();
+      if (fn.endsWith(".rte")) {
+        // Read header
+        char magic[4]; f.read((uint8_t*)magic, 4);
+        uint8_t ver = f.read(); f.read(); // flags
+        uint16_t cnt; f.read((uint8_t*)&cnt, 2);
+        uint32_t dist; f.read((uint8_t*)&dist, 4);
+        char name[16]; f.read((uint8_t*)name, 16); name[15] = '\0';
+
+        // Get just filename without path
+        String basename = fn;
+        int sl = basename.lastIndexOf('/');
+        if (sl >= 0) basename = basename.substring(sl + 1);
+
+        bool isActive = (strcmp(basename.c_str(), activeName) == 0);
+
+        if (!first) json += ",";
+        json += "{\"filename\":\"" + basename + "\",\"name\":\"" + String(name) + "\",\"points\":" + String(cnt) + ",\"distance\":" + String(dist) + ",\"active\":" + (isActive ? "true" : "false") + "}";
+        first = false;
+      }
+      f = dir.openNextFile();
+    }
+    dir.close();
+  }
+  sdRelease();
+  json += "]}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleRouteStart() {
+  String body = webServer.arg("plain");
+  // Parse name, filename, count
+  int nPos = body.indexOf("\"name\"");
+  int fPos = body.indexOf("\"filename\"");
+  int cPos = body.indexOf("\"count\"");
+
+  if (nPos < 0 || fPos < 0 || cPos < 0) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad params\"}");
+    return;
+  }
+
+  // Extract filename string
+  int fq1 = body.indexOf('"', body.indexOf(':', fPos) + 1);
+  int fq2 = body.indexOf('"', fq1 + 1);
+  String fname = body.substring(fq1 + 1, fq2);
+  strncpy(routeUploadFilename, fname.c_str(), 31);
+
+  // Extract name
+  int nq1 = body.indexOf('"', body.indexOf(':', nPos) + 1);
+  int nq2 = body.indexOf('"', nq1 + 1);
+  strncpy(routeUploadName, body.substring(nq1 + 1, nq2).c_str(), 15);
+
+  routeUploadCount = body.substring(body.indexOf(':', cPos) + 1).toInt();
+  routeUploadReceived = 0;
+
+  // Create route file with header
+  char path[48];
+  snprintf(path, sizeof(path), "/routes/%s", routeUploadFilename);
+
+  sdAcquire();
+  SD.mkdir("/routes");
+  routeUploadFile = SD.open(path, FILE_WRITE);
+  if (!routeUploadFile) {
+    sdRelease();
+    webServer.send(500, "application/json", "{\"ok\":false,\"error\":\"file create failed\"}");
+    return;
+  }
+
+  // Write header
+  routeUploadFile.write((uint8_t*)"RTE\0", 4);
+  uint8_t ver = 1, flags = 0;
+  routeUploadFile.write(ver);
+  routeUploadFile.write(flags);
+  routeUploadFile.write((uint8_t*)&routeUploadCount, 2);
+  uint32_t distPlaceholder = 0;
+  routeUploadFile.write((uint8_t*)&distPlaceholder, 4);
+  char nameBuf[16] = {0};
+  strncpy(nameBuf, routeUploadName, 15);
+  routeUploadFile.write((uint8_t*)nameBuf, 16);
+  sdRelease();
+
+  Serial.printf("Route upload start: %s (%d pts)\n", routeUploadFilename, routeUploadCount);
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleRoutePoints() {
+  String body = webServer.arg("plain");
+  // Parse pts array: {"pts":[[lat,lon],[lat,lon],...]}
+  int idx = body.indexOf('[', body.indexOf("pts"));
+  if (idx < 0) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"no pts\"}");
+    return;
+  }
+
+  sdAcquire();
+  if (!routeUploadFile) { sdRelease(); webServer.send(400, "application/json", "{\"ok\":false}"); return; }
+
+  // Parse point pairs
+  int pos = idx;
+  while (pos < (int)body.length()) {
+    int ob = body.indexOf('[', pos + 1);
+    if (ob < 0) break;
+    int cb = body.indexOf(']', ob);
+    if (cb < 0) break;
+    String pair = body.substring(ob + 1, cb);
+    int comma = pair.indexOf(',');
+    if (comma > 0) {
+      float lat = pair.substring(0, comma).toFloat();
+      float lon = pair.substring(comma + 1).toFloat();
+      int32_t ilat = (int32_t)(lat * 1e7f);
+      int32_t ilon = (int32_t)(lon * 1e7f);
+      routeUploadFile.write((uint8_t*)&ilat, 4);
+      routeUploadFile.write((uint8_t*)&ilon, 4);
+      routeUploadReceived++;
+    }
+    pos = cb + 1;
+  }
+  sdRelease();
+
+  webServer.send(200, "application/json", "{\"ok\":true,\"received\":" + String(routeUploadReceived) + "}");
+}
+
+void handleRouteFinish() {
+  if (!routeUploadFile) {
+    webServer.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+
+  sdAcquire();
+  routeUploadFile.flush();
+  routeUploadFile.close();
+  sdRelease();
+
+  // Reload to compute distance and rewrite header
+  // (loadRoute reads the file, computes distances)
+  Serial.printf("Route upload done: %s (%d pts received)\n", routeUploadFilename, routeUploadReceived);
+
+  webServer.send(200, "application/json", "{\"ok\":true,\"filename\":\"" + String(routeUploadFilename) + "\",\"points\":" + String(routeUploadReceived) + "}");
+}
+
+void handleRouteActivate() {
+  String body = webServer.arg("plain");
+  int fq1 = body.indexOf("\"filename\"");
+  if (fq1 < 0) { webServer.send(400, "application/json", "{\"ok\":false}"); return; }
+  int q1 = body.indexOf('"', body.indexOf(':', fq1) + 1);
+  int q2 = body.indexOf('"', q1 + 1);
+  String fname = body.substring(q1 + 1, q2);
+
+  setActiveRoute(fname.c_str());
+  loadRoute(fname.c_str());
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleRouteGet() {
+  // GET /api/routes/filename.rte — return as JSON with points
+  String uri = webServer.uri();
+  String fname = uri.substring(uri.lastIndexOf('/') + 1);
+  char path[48];
+  snprintf(path, sizeof(path), "/routes/%s", fname.c_str());
+
+  sdAcquire();
+  File f = SD.open(path, FILE_READ);
+  if (!f) { sdRelease(); webServer.send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+
+  // Read header
+  f.seek(4); f.read(); f.read(); // skip magic, ver, flags
+  uint16_t cnt; f.read((uint8_t*)&cnt, 2);
+  uint32_t dist; f.read((uint8_t*)&dist, 4);
+  char name[16]; f.read((uint8_t*)name, 16); name[15] = '\0';
+
+  String json = "{\"name\":\"" + String(name) + "\",\"distance\":" + String(dist) + ",\"points\":[";
+  for (int i = 0; i < cnt; i++) {
+    int32_t lat, lon;
+    f.read((uint8_t*)&lat, 4);
+    f.read((uint8_t*)&lon, 4);
+    if (i > 0) json += ",";
+    json += "[" + String(lat / 1e7f, 7) + "," + String(lon / 1e7f, 7) + "]";
+  }
+  json += "]}";
+  f.close();
+  sdRelease();
+  webServer.send(200, "application/json", json);
+}
+
+void handleRouteDelete() {
+  String uri = webServer.uri();
+  String fname = uri.substring(uri.lastIndexOf('/') + 1);
+  char path[48];
+  snprintf(path, sizeof(path), "/routes/%s", fname.c_str());
+  sdAcquire();
+  bool ok = SD.remove(path);
+  sdRelease();
+  webServer.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+// Serve route editor HTML from SD
+void handleRouteEditor() {
+  sdAcquire();
+  File f = SD.open("/web/route.html", FILE_READ);
+  if (!f) {
+    sdRelease();
+    webServer.send(404, "text/plain", "route.html not found on SD. Upload it to /web/route.html");
+    return;
+  }
+  size_t fsize = f.size();
+  webServer.setContentLength(fsize);
+  webServer.send(200, "text/html", "");
+  uint8_t buf[512];
+  while (f.available()) {
+    int len = f.read(buf, sizeof(buf));
+    webServer.sendContent((const char*)buf, len);
+  }
+  f.close();
+  sdRelease();
+}
+
 void handleNotFound() {
-  // Handle DELETE /api/tiles/xxx — WebServer doesn't support wildcard routes natively
   if (webServer.method() == HTTP_DELETE && webServer.uri().startsWith("/api/tiles/")) {
     handleDeleteTile();
     return;
+  }
+  // Route file GET/DELETE
+  if (webServer.uri().startsWith("/api/routes/") && webServer.uri().endsWith(".rte")) {
+    if (webServer.method() == HTTP_DELETE) { handleRouteDelete(); return; }
+    if (webServer.method() == HTTP_GET) { handleRouteGet(); return; }
   }
   webServer.send(404, "text/plain", "Not found");
 }
@@ -266,6 +523,12 @@ void setupWebServer() {
   webServer.on("/api/nav", HTTP_POST, handleStartNav);
   webServer.on("/api/screens", HTTP_GET, handleGetScreens);
   webServer.on("/api/screens", HTTP_POST, handleSetScreen);
+  webServer.on("/api/routes", HTTP_GET, handleRouteList);
+  webServer.on("/api/routes/start", HTTP_POST, handleRouteStart);
+  webServer.on("/api/routes/points", HTTP_POST, handleRoutePoints);
+  webServer.on("/api/routes/finish", HTTP_POST, handleRouteFinish);
+  webServer.on("/api/routes/activate", HTTP_POST, handleRouteActivate);
+  webServer.on("/route.html", HTTP_GET, handleRouteEditor);
   webServer.onNotFound(handleNotFound);
 
   webServer.begin();

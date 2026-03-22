@@ -48,6 +48,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 
 <div class="tabs">
   <button class="tab active" onclick="switchTab('map')">Map & Tiles</button>
+  <button class="tab" onclick="switchTab('routes')">Routes</button>
   <button class="tab" onclick="switchTab('screens')">Screens</button>
   <button class="tab" onclick="switchTab('device')">Device</button>
 </div>
@@ -71,6 +72,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <button class="btn btn-danger" onclick="deleteAll()" style="padding:2px 8px;font-size:11px">Delete All</button></span>
   </div>
   <div class="tile-list" id="tileList"></div>
+</div>
+
+<div id="panel-routes" class="panel">
+  <div style="padding:16px;text-align:center">
+    <h3 style="color:#e94560;margin-bottom:12px">Walking Route Editor</h3>
+    <p style="color:#8899aa;margin-bottom:16px">Draw walking routes on the map, save to SD card for offline navigation.</p>
+    <a href="/route.html" class="btn btn-primary" style="text-decoration:none;padding:10px 24px;font-size:15px;display:inline-block">Open Route Editor</a>
+    <div id="routeListMain" style="margin-top:20px;text-align:left"></div>
+  </div>
 </div>
 
 <div id="panel-screens" class="panel">
@@ -99,7 +109,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <script>
 const API = '';
 let map, selRect, selBounds, tileGrid, selecting = false;
-let dlPollTimer = null;
+let dlPollTimer = null, dlPolling = false;
 
 // Tabs
 function switchTab(name) {
@@ -107,6 +117,7 @@ function switchTab(name) {
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-'+name));
   if (name === 'device') loadDeviceInfo();
   if (name === 'screens') loadScreens();
+  if (name === 'routes') loadRouteList();
   if (name === 'map') setTimeout(() => map.invalidateSize(), 100);
 }
 
@@ -187,6 +198,8 @@ async function startDownload() {
 
 function pollProgress() {
   dlPollTimer = setInterval(async () => {
+    if (dlPolling) return;  // skip if previous poll still in flight
+    dlPolling = true;
     try {
       const r = await fetch(API+'/api/download/status');
       const j = await r.json();
@@ -202,7 +215,8 @@ function pollProgress() {
         loadTiles();
       }
     } catch(e) { setStatus('Poll error: '+e.message); }
-  }, 1500);
+    finally { dlPolling = false; }
+  }, 3000);
 }
 
 async function cancelDownload() {
@@ -272,6 +286,21 @@ async function loadDeviceInfo() {
 }
 
 function setStatus(msg) { document.getElementById('statusMsg').textContent = msg; }
+
+async function loadRouteList() {
+  try {
+    const r = await fetch(API+'/api/routes');
+    const j = await r.json();
+    let html = '<table style="width:100%;font-size:13px;border-collapse:collapse">';
+    if (!j.routes.length) html += '<tr><td style="color:#666;padding:8px">No routes saved. Open the Route Editor to create one.</td></tr>';
+    j.routes.forEach(rt => {
+      html += '<tr style="border-bottom:1px solid #222"><td style="padding:6px;color:' + (rt.active?'#e94560':'#e0e0e0') + '">' + rt.name + (rt.active?' (active)':'') + '</td>';
+      html += '<td style="color:#8899aa;padding:6px">' + rt.points + ' pts, ' + (rt.distance<1000?rt.distance+'m':(rt.distance/1000).toFixed(1)+'km') + '</td></tr>';
+    });
+    html += '</table>';
+    document.getElementById('routeListMain').innerHTML = html;
+  } catch(e) {}
+}
 
 // Screen management
 async function loadScreens() {
