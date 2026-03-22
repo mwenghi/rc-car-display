@@ -119,17 +119,24 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 [1] _reserved        uint8
 ```
 
-### 0x13 CMD_TRACK (2 bytes payload, on event)
+### 0x13 CMD_MENU (2 bytes payload, on event)
 ```
-[0] command          uint8    0=enter_select 1=exit_select 2=next 3=prev
-                              4=confirm 5=start_nav 6=preview
+[0] command          uint8    0=open 1=close 2=next 3=prev
+                              4=enter/confirm 5=back 6=start_nav 7=preview
 [1] _reserved        uint8
 ```
 
-**Track selection via steering/throttle (when selection mode is active):**
-- Steer left (pos < 80): previous track
-- Steer right (pos > 175): next track
-- Throttle to full (>90%) then back to 0 (<10%): confirm selection
+**Menu structure (3-level):**
+- L1: Screen Select, Navigation
+- L2 (Screen Select): Display 1
+- L2 (Navigation): Track Select
+- L3 (Display 1): Dashboard, Navigation, Media, IMU, About
+- L3 (Track Select): list of .rte files from SD
+
+**Menu control via steering/throttle (when menu is active):**
+- Steer left (pos < 80): previous item
+- Steer right (pos > 175): next item
+- Throttle to full (>90%) then back to 0 (<10%): enter/confirm
 
 ### 0xFE HEARTBEAT (2 bytes payload, 2 Hz)
 ```
@@ -139,7 +146,7 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 ## Screen Indices
 
 ### D1 (Main Display)
-0=Dashboard, 1=Navigation, 2=Media, 3=About
+0=Dashboard, 1=Navigation, 2=Media, 3=IMU, 4=About
 
 ### D2 (Second Display)
 0=Navigation, 1=Map, 2=Battery, 3=Signal, 4=Media, 5=Radio, 6=Debug

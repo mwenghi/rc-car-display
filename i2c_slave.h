@@ -17,7 +17,7 @@
 #define MSG_CMD_SCREEN     0x10
 #define MSG_CMD_BRIGHTNESS 0x11
 #define MSG_CMD_MEDIA      0x12
-#define MSG_CMD_TRACK      0x13  // track selection/nav control
+#define MSG_CMD_MENU       0x13  // menu navigation control
 #define MSG_HEARTBEAT 0xFE
 
 // Timeout for master presence detection
@@ -244,27 +244,29 @@ void parseI2CMessage() {
       }
       break;
 
-    case MSG_CMD_TRACK:
-      // Track selection control
-      // p[0] = command: 0=enter_select, 1=exit_select, 2=next, 3=prev,
-      //                 4=confirm, 5=start_nav, 6=preview
+    case MSG_CMD_MENU:
+      // Menu navigation control
+      // p[0] = command: 0=open, 1=close, 2=next, 3=prev,
+      //                 4=enter/confirm, 5=back, 6=start_nav, 7=preview
       // p[1] = param (unused for now)
       if (len >= 5) {
-        extern void enterTrackSelection();
-        extern void exitTrackSelection();
-        extern void trackSelectNext();
-        extern void trackSelectPrev();
-        extern void trackConfirmSelection();
+        extern void menuOpen();
+        extern void menuClose();
+        extern void menuNext();
+        extern void menuPrev();
+        extern void menuEnter();
+        extern void menuBack();
         extern void startNavigation();
         extern void startPreview();
         switch (p[0]) {
-          case 0: enterTrackSelection(); break;
-          case 1: exitTrackSelection(); break;
-          case 2: trackSelectNext(); break;
-          case 3: trackSelectPrev(); break;
-          case 4: trackConfirmSelection(); break;
-          case 5: startNavigation(); break;
-          case 6: startPreview(); break;
+          case 0: menuOpen(); break;
+          case 1: menuClose(); break;
+          case 2: menuNext(); break;
+          case 3: menuPrev(); break;
+          case 4: menuEnter(); break;
+          case 5: menuBack(); break;
+          case 6: startNavigation(); break;
+          case 7: startPreview(); break;
         }
       }
       break;

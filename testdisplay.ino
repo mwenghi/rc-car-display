@@ -616,7 +616,7 @@ void renderMap() {
     TFT_RED);
 
   // Position dot (blinks red during preview)
-  if (trackSel.previewMode && (millis() / 350) % 2) {
+  if (menu.previewMode && (millis() / 350) % 2) {
     disp2.fillCircle(mx, my, 7, TFT_RED);
     disp2.fillCircle(mx, my, 3, TFT_WHITE);
   } else {
@@ -669,7 +669,7 @@ void renderD2Navigation() {
   int mx = (int)simX - vpX;
   int my = (int)simY - vpY;
   if (my >= 0 && my < 160) {
-    if (trackSel.previewMode && (millis() / 350) % 2) {
+    if (menu.previewMode && (millis() / 350) % 2) {
       disp2.fillCircle(mx, my, 5, TFT_RED);
       disp2.fillCircle(mx, my, 2, TFT_WHITE);
     } else {
@@ -2252,9 +2252,9 @@ void renderD1() {
     d1PrevScreen = d1Screen;
   }
 
-  // Track selection takes over D1 when active
-  if (trackSel.active) {
-    renderD1TrackSelection();
+  // Menu takes over D1 when active
+  if (menuIsActive()) {
+    renderD1Menu();
     return;
   }
 
@@ -2501,15 +2501,16 @@ void bootAnimation() {
 
 // ─── Serial command processor (for testing) ─────────────────────────────────
 // Commands:
-//   ts        - enter track selection mode
-//   te        - exit track selection mode
-//   tn        - next track
-//   tp        - previous track
-//   tc        - confirm/select track
+//   mo        - open menu
+//   mc        - close menu
+//   mn        - menu next
+//   mp        - menu prev
+//   me        - menu enter/confirm
+//   mb        - menu back
 //   ns        - start/restart navigation
 //   np        - preview selected track
-//   d1 <n>    - switch D1 screen (0-3)
-//   d2 <n>    - switch D2 screen (0-5)
+//   d1 <n>    - switch D1 screen
+//   d2 <n>    - switch D2 screen
 
 void processSerialCommands() {
   if (!Serial.available()) return;
@@ -2520,20 +2521,22 @@ void processSerialCommands() {
 
   Serial.printf("> %s\n", cmd.c_str());
 
-  if (cmd == "ts") {
-    enterTrackSelection();
-  } else if (cmd == "te") {
-    exitTrackSelection();
-  } else if (cmd == "tn") {
-    trackSelectNext();
-  } else if (cmd == "tp") {
-    trackSelectPrev();
-  } else if (cmd == "tc") {
-    trackConfirmSelection();
+  if (cmd == "mo") {
+    menuOpen();
+  } else if (cmd == "mc") {
+    menuClose();
+  } else if (cmd == "mn") {
+    menuNext();
+  } else if (cmd == "mp") {
+    menuPrev();
+  } else if (cmd == "me") {
+    menuEnter();
+  } else if (cmd == "mb") {
+    menuBack();
   } else if (cmd == "ns") {
     startNavigation();
   } else if (cmd == "np") {
-    if (trackSel.previewMode) stopPreview();
+    if (menu.previewMode) stopPreview();
     else startPreview();
   } else if (cmd.startsWith("d1 ")) {
     int scr = cmd.substring(3).toInt();
@@ -2550,7 +2553,7 @@ void processSerialCommands() {
       Serial.printf("D2 -> %s\n", d2ScreenNames[scr]);
     }
   } else if (cmd == "help") {
-    Serial.println("Commands: ts te tn tp tc ns np d1<n> d2<n> help");
+    Serial.println("Commands: mo mc mn mp me mb ns np d1<n> d2<n> help");
   } else {
     Serial.printf("Unknown: %s (type 'help')\n", cmd.c_str());
   }
@@ -2701,20 +2704,20 @@ void loop() {
     checkI2CTimeout();
     processSerialCommands();
 
-    // Track selection via I2C steering/throttle
-    if (trackSel.active && liveData.masterPresent) {
+    // Menu navigation via I2C steering/throttle
+    if (menuIsActive() && liveData.masterPresent) {
       static unsigned long lastSteerAction = 0;
       static bool throttleWasHigh = false;
-      // Steer left (< 80) / right (> 175) to browse tracks
+      // Steer left (< 80) / right (> 175) to browse
       if (millis() - lastSteerAction > 400) {
-        if (liveData.steer_pos < 80) { trackSelectPrev(); lastSteerAction = millis(); }
-        else if (liveData.steer_pos > 175) { trackSelectNext(); lastSteerAction = millis(); }
+        if (liveData.steer_pos < 80) { menuPrev(); lastSteerAction = millis(); }
+        else if (liveData.steer_pos > 175) { menuNext(); lastSteerAction = millis(); }
       }
-      // Throttle to full (>90%) then back to 0 (<10%) to confirm
+      // Throttle to full (>90%) then back to 0 (<10%) to confirm/enter
       if (liveData.throttle_pct > 90) throttleWasHigh = true;
       if (throttleWasHigh && liveData.throttle_pct < 10) {
         throttleWasHigh = false;
-        trackConfirmSelection();
+        menuEnter();
       }
     }
 
@@ -2737,7 +2740,7 @@ void loop() {
     }
 
     // Preview overrides liveData position/heading AFTER sim (takes priority)
-    if (trackSel.previewMode) {
+    if (menu.previewMode) {
       updatePreview();
     }
 
