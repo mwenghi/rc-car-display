@@ -18,6 +18,11 @@
 #define MSG_CMD_BRIGHTNESS 0x11
 #define MSG_CMD_MEDIA      0x12
 #define MSG_CMD_MENU       0x13  // menu navigation control
+#define MSG_VCONF_DEFINE   0x20  // define custom menu item
+#define MSG_VCONF_OPTION   0x21  // option label for options-type item
+#define MSG_VCONF_UPDATE   0x22  // update item value
+#define MSG_VCONF_CLEAR    0x23  // clear item(s)
+#define MSG_VCONF_GROUP    0x24  // assign item to submenu group
 #define MSG_HEARTBEAT 0xFE
 
 // Timeout for master presence detection
@@ -287,6 +292,22 @@ void parseI2CMessage() {
       }
       break;
 
+    case MSG_VCONF_DEFINE:
+      vconfParseDefine(p, len - 3);
+      break;
+    case MSG_VCONF_OPTION:
+      vconfParseOptionLabel(p, len - 3);
+      break;
+    case MSG_VCONF_UPDATE:
+      vconfParseUpdateValue(p, len - 3);
+      break;
+    case MSG_VCONF_CLEAR:
+      vconfParseClear(p, len - 3);
+      break;
+    case MSG_VCONF_GROUP:
+      vconfParseSetGroup(p, len - 3);
+      break;
+
     default:
       Serial.printf("I2C: unknown msg 0x%02X\n", msgType);
       break;
@@ -351,10 +372,19 @@ void checkI2CTimeout() {
   }
 }
 
+// ─── I2C request callback (MEGA polls for menu events) ──────────────────────
+
+void onI2CRequest() {
+  uint8_t resp[4];
+  vconfDequeueEvent(resp);
+  Wire1.write(resp, 4);
+}
+
 // ─── Init I2C slave ──────────────────────────────────────────────────────────
 
 void setupI2CSlave() {
   Wire1.begin(I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN, 400000);
   Wire1.onReceive(onI2CReceive);
+  Wire1.onRequest(onI2CRequest);
   Serial.printf("I2C slave on 0x%02X (SDA=%d SCL=%d)\n", I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
 }

@@ -376,8 +376,8 @@ void setActiveRoute(const char* filename) {
 enum MenuLevel { MENU_CLOSED = 0, MENU_L1, MENU_L2, MENU_L3 };
 
 // Top-level menu entries
-enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_COUNT };
-static const char* menuL1Names[] = {"Screen Select", "Navigation"};
+enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_VEHICLE, ML1_COUNT };
+static const char* menuL1Names[] = {"Screen Select", "Navigation", "Vehicle"};
 
 // Screen Select sub-items
 enum MenuL2Screen { ML2S_DISPLAY1 = 0, ML2S_DISPLAY2, ML2S_COUNT };
@@ -471,6 +471,7 @@ static int menuItemCount() {
     case MENU_L2:
       if (menu.l1Parent == ML1_SCREEN_SEL) return ML2S_COUNT;
       if (menu.l1Parent == ML1_NAVIGATION) return ML2N_COUNT;
+      if (menu.l1Parent == ML1_VEHICLE) return vconfRootCount();
       return 0;
     case MENU_L3:
       if (menu.l1Parent == ML1_SCREEN_SEL) {
@@ -479,6 +480,12 @@ static int menuItemCount() {
       }
       if (menu.l1Parent == ML1_NAVIGATION && menu.l2Parent == ML2N_TRACK_SEL)
         return menu.trackCount;
+      if (menu.l1Parent == ML1_VEHICLE) {
+        // L3 = children of a submenu item
+        VConfItem* parent = vconfRootItem(menu.l2Parent);
+        if (parent && parent->type == VCONF_SUBMENU)
+          return vconfChildCount(parent->id);
+      }
       return 0;
     default: return 0;
   }
@@ -498,6 +505,8 @@ static int8_t* menuIdx() {
 
 void menuNext() {
   if (menu.level == MENU_CLOSED) return;
+  // Number editing: adjust value instead of scrolling
+  if (vconf.editing) { vconfItemAdjust(+1); return; }
   int total = menuTotalCount();
   if (total == 0) return;
   int8_t* idx = menuIdx();
@@ -506,6 +515,7 @@ void menuNext() {
 
 void menuPrev() {
   if (menu.level == MENU_CLOSED) return;
+  if (vconf.editing) { vconfItemAdjust(-1); return; }
   int total = menuTotalCount();
   if (total == 0) return;
   int8_t* idx = menuIdx();
@@ -555,6 +565,22 @@ void menuEnter() {
       menuClose();
       return;
     }
+    // Vehicle config items — interact in-place at L2
+    if (menu.l1Parent == ML1_VEHICLE) {
+      VConfItem* item = vconfRootItem(menu.l2Idx);
+      if (item) {
+        if (item->type == VCONF_SUBMENU) {
+          // Enter submenu → L3
+          menu.l2Parent = menu.l2Idx;
+          menu.l3Idx = 0;
+          menu.level = MENU_L3;
+          return;
+        }
+        vconfItemEnter(item);
+      }
+      return;
+    }
+
     // Sub-menu items — enter L3
     menu.l2Parent = menu.l2Idx;
     menu.l3Idx = 0;
@@ -594,11 +620,19 @@ void menuEnter() {
         loadRoute(fname);
         menuClose();
       }
+    } else if (menu.l1Parent == ML1_VEHICLE) {
+      // L3 = children of a submenu — interact in-place
+      VConfItem* parent = vconfRootItem(menu.l2Parent);
+      if (parent && parent->type == VCONF_SUBMENU) {
+        VConfItem* child = vconfChildItem(parent->id, menu.l3Idx);
+        if (child) vconfItemEnter(child);
+      }
     }
   }
 }
 
 void menuBack() {
+  if (vconf.editing) { vconfCancelEdit(); return; }
   if (menu.level == MENU_L3) {
     menu.level = MENU_L2;
   } else if (menu.level == MENU_L2) {
@@ -851,6 +885,142 @@ static void drawMenuList(const char* title, const char** items, int count,
   sprite1.pushSprite(0, 0);
 }
 
+// Helper for L3 vehicle submenu child lookup
+static uint8_t _vconfChildGroupId = 0;
+static VConfItem* _vconfChildItemWrapper(int idx) {
+  return vconfChildItem(_vconfChildGroupId, idx);
+}
+
+// Draw vehicle config item list (name + value on right)
+// items come from vconfRootItem(idx) or vconfChildItem(groupId, idx)
+static void drawVehicleList(const char* title, const char* breadcrumb,
+                            int count, int selIdx,
+                            VConfItem* (*getItem)(int)) {
+  sprite1.fillScreen(TFT_BLACK);
+
+  // Title bar
+  sprite1.fillRect(0, 0, 240, 16, 0x0841);
+  sprite1.setTextSize(1);
+  if (breadcrumb) {
+    sprite1.setTextColor(0x4A69);
+    sprite1.setCursor(4, 4);
+    sprite1.print(breadcrumb);
+    sprite1.setTextColor(TFT_CYAN);
+    sprite1.print(" > ");
+  } else {
+    sprite1.setTextColor(TFT_CYAN);
+    sprite1.setCursor(4, 4);
+  }
+  sprite1.print(title);
+
+  int totalItems = count + 1;  // +1 for Back
+  int maxVis = 4;
+  int visCount = min(maxVis, totalItems);
+  int startIdx = selIdx - visCount / 2;
+  if (startIdx < 0) startIdx = 0;
+  if (startIdx + visCount > totalItems) startIdx = totalItems - visCount;
+
+  if (count == 0) {
+    sprite1.setTextSize(2);
+    sprite1.setTextColor(0x8410);
+    sprite1.setCursor(18, 50);
+    sprite1.print("No items");
+  }
+
+  for (int i = 0; i < visCount; i++) {
+    int idx = startIdx + i;
+    int y = 18 + i * 24;
+    bool selected = (idx == selIdx);
+
+    if (selected) {
+      sprite1.fillRect(2, y, 236, 22, 0x0841);
+      sprite1.drawRect(2, y, 236, 22, TFT_CYAN);
+    }
+
+    sprite1.setTextSize(2);
+    sprite1.setCursor(8, y + 3);
+
+    if (idx < count) {
+      VConfItem* item = getItem(idx);
+      if (!item) continue;
+
+      sprite1.setTextColor(selected ? TFT_WHITE : 0x8410);
+      sprite1.print(item->name);
+
+      // Value on right side
+      sprite1.setTextSize(1);
+      bool isEditing = (vconf.editing && vconf.editSlot == item->id);
+
+      switch (item->type) {
+        case VCONF_TOGGLE: {
+          bool on = item->value != 0;
+          sprite1.setTextColor(on ? TFT_GREEN : TFT_RED);
+          sprite1.setCursor(200, y + 7);
+          sprite1.print(on ? "ON" : "OFF");
+          break;
+        }
+        case VCONF_NUMBER: {
+          int16_t dispVal = isEditing ? vconf.editValue : item->value;
+          sprite1.setTextColor(isEditing ? TFT_YELLOW : (selected ? 0xC618 : 0x6B6D));
+          sprite1.setCursor(188, y + 7);
+          if (isEditing) sprite1.printf("[%d]", dispVal);
+          else sprite1.printf("%d", dispVal);
+          break;
+        }
+        case VCONF_OPTIONS: {
+          sprite1.setTextColor(selected ? TFT_CYAN : 0x6B6D);
+          sprite1.setCursor(160, y + 7);
+          int oi = constrain(item->value, 0, item->optionCount - 1);
+          if (item->optionCount > 0)
+            sprite1.print(item->optionLabels[oi]);
+          break;
+        }
+        case VCONF_ACTION: {
+          sprite1.setTextColor(selected ? TFT_YELLOW : 0x4208);
+          sprite1.setCursor(224, y + 7);
+          sprite1.print("!");
+          break;
+        }
+        case VCONF_SUBMENU: {
+          sprite1.setTextColor(selected ? 0x6B6D : 0x4208);
+          sprite1.setCursor(224, y + 3);
+          sprite1.setTextSize(2);
+          sprite1.print(">");
+          break;
+        }
+      }
+    } else {
+      sprite1.setTextColor(selected ? TFT_ORANGE : 0x6B6D);
+      sprite1.print("< Back");
+    }
+  }
+
+  // Scroll indicators
+  sprite1.setTextSize(1);
+  if (startIdx > 0) {
+    sprite1.setTextColor(0x4A69);
+    sprite1.setCursor(116, 17);
+    sprite1.print("^");
+  }
+  if (startIdx + visCount < totalItems) {
+    sprite1.setTextColor(0x4A69);
+    sprite1.setCursor(116, 115);
+    sprite1.print("v");
+  }
+
+  // Bottom hint bar
+  sprite1.fillRect(0, 122, 240, 13, 0x0841);
+  sprite1.setTextColor(0x4A69);
+  sprite1.setTextSize(1);
+  sprite1.setCursor(20, 125);
+  if (vconf.editing)
+    sprite1.print("UP/DN:adjust  OK:confirm  BACK:cancel");
+  else
+    sprite1.print("UP/DN:browse  OK:select  BACK:up");
+
+  sprite1.pushSprite(0, 0);
+}
+
 void renderD1Menu() {
   extern const char* d1ScreenNames[];
   extern const char* d2ScreenNames[];
@@ -871,6 +1041,9 @@ void renderD1Menu() {
       if (menu.previewMode) navNames[ML2N_PREVIEW] = menuL2NavPreviewStop;
       drawMenuList("NAVIGATION", navNames, ML2N_COUNT,
                    menu.l2Idx, "Nav");
+    } else if (menu.l1Parent == ML1_VEHICLE) {
+      drawVehicleList("VEHICLE", "Vehicle", vconfRootCount(),
+                      menu.l2Idx, vconfRootItem);
     }
     return;
   }
@@ -962,6 +1135,15 @@ void renderD1Menu() {
       sprite1.setCursor(20, 125);
       sprite1.print("UP/DN:browse  OK:select  BACK:up");
       sprite1.pushSprite(0, 0);
+    } else if (menu.l1Parent == ML1_VEHICLE) {
+      // L3 = children of a vehicle submenu
+      VConfItem* parent = vconfRootItem(menu.l2Parent);
+      if (parent && parent->type == VCONF_SUBMENU) {
+        _vconfChildGroupId = parent->id;
+        drawVehicleList(parent->name, "Vehicle",
+          vconfChildCount(parent->id), menu.l3Idx,
+          _vconfChildItemWrapper);
+      }
     }
   }
 }

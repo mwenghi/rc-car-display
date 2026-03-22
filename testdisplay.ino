@@ -212,6 +212,7 @@ void checkScreenButton() {
   btnWasPressed = pressed;
 }
 
+#include "vehicle_config.h"
 #include "i2c_slave.h"
 #include "navigation.h"
 #include "web_server.h"
@@ -2661,8 +2662,51 @@ void processSerialCommands() {
       saveScreenState();
       Serial.printf("D2 -> %s\n", d2ScreenNames[scr]);
     }
+  } else if (cmd == "vtest") {
+    // Define test vehicle config items for debugging
+    // Item 0: toggle
+    uint8_t buf0[] = {0, VCONF_TOGGLE, 0, 'H','e','a','d','l','i','g','h','t','s', 1};
+    vconfParseDefine(buf0, sizeof(buf0));
+    // Item 1: number (value=50, min=0, max=200, step=5)
+    uint8_t buf1[21] = {1, VCONF_NUMBER, 0, 'M','a','x',' ','S','p','e','e','d',0};
+    int16_t v=50, mn=0, mx=200, st=5;
+    memcpy(&buf1[13], &v, 2); memcpy(&buf1[15], &mn, 2);
+    memcpy(&buf1[17], &mx, 2); memcpy(&buf1[19], &st, 2);
+    vconfParseDefine(buf1, sizeof(buf1));
+    // Item 2: options (3 options)
+    uint8_t buf2[] = {2, VCONF_OPTIONS, 0, 'D','r','i','v','e','M','o','d','e',0, 0, 3};
+    vconfParseDefine(buf2, sizeof(buf2));
+    uint8_t opt0[] = {2, 0, 'E','c','o',0,0,0,0,0,0,0};
+    uint8_t opt1[] = {2, 1, 'N','o','r','m','a','l',0,0,0,0};
+    uint8_t opt2[] = {2, 2, 'S','p','o','r','t',0,0,0,0,0};
+    vconfParseOptionLabel(opt0, sizeof(opt0));
+    vconfParseOptionLabel(opt1, sizeof(opt1));
+    vconfParseOptionLabel(opt2, sizeof(opt2));
+    // Item 3: action
+    uint8_t buf3[] = {3, VCONF_ACTION, 0, 'C','a','l','i','b','r','a','t','e',0};
+    vconfParseDefine(buf3, sizeof(buf3));
+    // Item 4: submenu
+    uint8_t buf4[] = {4, VCONF_SUBMENU, 0, 'A','d','v','a','n','c','e','d',0,0, 0xFF};
+    vconfParseDefine(buf4, sizeof(buf4));
+    // Item 5: toggle inside submenu (group=4)
+    uint8_t buf5[] = {5, VCONF_TOGGLE, 0, 'A','B','S',0,0,0,0,0,0,0, 1};
+    vconfParseDefine(buf5, sizeof(buf5));
+    uint8_t grp5[] = {5, 4};
+    vconfParseSetGroup(grp5, 2);
+    // Item 6: number inside submenu (group=4)
+    uint8_t buf6[21] = {6, VCONF_NUMBER, 0, 'P','I','D',' ','G','a','i','n',0,0};
+    int16_t v6=100, mn6=0, mx6=500, st6=10;
+    memcpy(&buf6[13], &v6, 2); memcpy(&buf6[15], &mn6, 2);
+    memcpy(&buf6[17], &mx6, 2); memcpy(&buf6[19], &st6, 2);
+    vconfParseDefine(buf6, sizeof(buf6));
+    uint8_t grp6[] = {6, 4};
+    vconfParseSetGroup(grp6, 2);
+    Serial.println("VConf: test items created");
+  } else if (cmd == "vclear") {
+    uint8_t buf[] = {0xFF};
+    vconfParseClear(buf, 1);
   } else if (cmd == "help") {
-    Serial.println("Commands: mo mc mn mp me mb ns np d1<n> d2<n> help");
+    Serial.println("Commands: mo mc mn mp me mb ns np d1<n> d2<n> vtest vclear help");
   } else {
     Serial.printf("Unknown: %s (type 'help')\n", cmd.c_str());
   }

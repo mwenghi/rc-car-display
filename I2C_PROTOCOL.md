@@ -127,16 +127,85 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 ```
 
 **Menu structure (3-level):**
-- L1: Screen Select, Navigation
-- L2 (Screen Select): Display 1
-- L2 (Navigation): Track Select
+- L1: Screen Select, Navigation, Vehicle
+- L2 (Screen Select): Display 1, Display 2
+- L2 (Navigation): Track Select, (Re)Start Nav, Stop Nav, Track Preview
+- L2 (Vehicle): dynamic items defined by MEGA (see 0x20-0x24)
 - L3 (Display 1): Dashboard, Navigation, Media, IMU, About
+- L3 (Display 2): Navigation, Map, Battery, Signal, Media, Radio, Debug
 - L3 (Track Select): list of .rte files from SD
+- L3 (Vehicle submenu): children of a submenu-type item
 
 **Menu control via steering/throttle (when menu is active):**
 - Steer left (pos < 80): previous item
 - Steer right (pos > 175): next item
 - Throttle to full (>90%) then back to 0 (<10%): enter/confirm
+
+### 0x20 VCONF_DEFINE_ITEM (13-21 bytes payload, on event)
+Define or redefine a custom vehicle configuration menu item.
+```
+[0]     item_id        uint8    0-15 (slot index)
+[1]     item_type      uint8    0=toggle, 1=number, 2=options, 3=action, 4=submenu
+[2]     flags          uint8    bit0=readonly, bit1=hidden
+[3..12] name           char[10] null-padded display label
+
+Type-specific data after name:
+  toggle:  [13] value          uint8   0=off, 1=on
+  number:  [13..14] value      int16   current value
+           [15..16] min        int16   minimum
+           [17..18] max        int16   maximum
+           [19..20] step       int16   increment step
+  options: [13] current_idx    uint8   selected option (0-based)
+           [14] option_count   uint8   total options (send labels via 0x21)
+  action:  (no extra data)
+  submenu: [13] parent_id      uint8   0xFF=root (usually 0xFF for the submenu itself)
+```
+
+### 0x21 VCONF_OPTION_LABEL (12 bytes payload, on event)
+Send one option label for an options-type item. Send after DEFINE.
+```
+[0]     item_id        uint8    which item
+[1]     option_idx     uint8    0-5
+[2..11] label          char[10] null-padded
+```
+
+### 0x22 VCONF_UPDATE_VALUE (3 bytes payload, on event)
+Update current value of an existing item (e.g. MEGA confirms change).
+```
+[0]     item_id        uint8
+[1..2]  value          int16    new value (little-endian)
+```
+
+### 0x23 VCONF_CLEAR (1 byte payload, on event)
+```
+[0]     item_id        uint8    0xFF=clear all, else clear specific item
+```
+
+### 0x24 VCONF_SET_GROUP (2 bytes payload, on event)
+Assign an item to a submenu group (for nesting under submenu-type items).
+```
+[0]     item_id        uint8    item to assign
+[1]     group_id       uint8    item_id of parent submenu (0xFF=root)
+```
+
+### Event Polling (ESP32 → MEGA)
+MEGA polls for user changes via `Wire.requestFrom(0x42, 4)`.
+ESP32 responds with 4 bytes:
+```
+[0]     item_id        uint8    0xFF=no event, else item that changed
+[1]     value_lo       uint8    new value low byte
+[2]     value_hi       uint8    new value high byte
+[3]     checksum       uint8    XOR of bytes 0..2
+```
+Events: toggle (0/1), number (confirmed value), options (new index),
+action (value=1 when triggered). Queue holds up to 8 events.
+
+**Item interaction on display:**
+- Toggle: Enter cycles on/off
+- Number: Enter starts edit → Up/Down adjust by step → Enter confirms
+- Options: Enter cycles to next option
+- Action: Enter triggers immediately
+- Submenu: Enter opens child list
 
 ### 0xFE HEARTBEAT (2 bytes payload, 2 Hz)
 ```
