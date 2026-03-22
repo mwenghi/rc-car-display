@@ -615,8 +615,14 @@ void renderMap() {
     ax + (int)(6 * sinf(simHeading + PI + ha)), ay - (int)(6 * cosf(simHeading + PI + ha)),
     TFT_RED);
 
-  // Position dot (blinks red during preview)
-  if (menu.previewMode && (millis() / 350) % 2) {
+  // Position dot
+  if (navRoute.active && navRoute.waitingForGPS) {
+    uint16_t col = ((millis() / 400) % 2) ? TFT_CYAN : TFT_GREEN;
+    disp2.fillCircle(mx, my, 7, col);
+    disp2.fillCircle(mx, my, 3, TFT_WHITE);
+    disp2.drawFastVLine(mx, my - 16, 16, TFT_WHITE);
+    disp2.fillRect(mx + 1, my - 16, 10, 6, TFT_GREEN);
+  } else if (menu.previewMode && (millis() / 350) % 2) {
     disp2.fillCircle(mx, my, 7, TFT_RED);
     disp2.fillCircle(mx, my, 3, TFT_WHITE);
   } else {
@@ -669,7 +675,15 @@ void renderD2Navigation() {
   int mx = (int)simX - vpX;
   int my = (int)simY - vpY;
   if (my >= 0 && my < 160) {
-    if (menu.previewMode && (millis() / 350) % 2) {
+    if (navRoute.active && navRoute.waitingForGPS) {
+      // Pulsing start-point marker (flag-like)
+      uint16_t col = ((millis() / 400) % 2) ? TFT_CYAN : TFT_GREEN;
+      disp2.fillCircle(mx, my, 6, col);
+      disp2.fillCircle(mx, my, 3, TFT_WHITE);
+      // Small flag pole + flag
+      disp2.drawFastVLine(mx, my - 14, 14, TFT_WHITE);
+      disp2.fillRect(mx + 1, my - 14, 8, 5, TFT_GREEN);
+    } else if (menu.previewMode && (millis() / 350) % 2) {
       disp2.fillCircle(mx, my, 5, TFT_RED);
       disp2.fillCircle(mx, my, 2, TFT_WHITE);
     } else {
@@ -683,12 +697,23 @@ void renderD2Navigation() {
 
   static int8_t prevTurnDir = -99;
   static bool prevTurnUrgent = false;
+  static bool prevNavWaiting = false;
+  static bool prevPreviewMode = false;
 
-  // One-time full clear on first frame or screen change
+  // Detect state transitions — force full redraw
+  bool curWaiting = navRoute.active && navRoute.waitingForGPS;
+  if (curWaiting != prevNavWaiting || menu.previewMode != prevPreviewMode) {
+    navBottomInit = false;
+    prevNavWaiting = curWaiting;
+    prevPreviewMode = menu.previewMode;
+  }
+
+  // One-time full clear on first frame or screen/state change
   if (!navBottomInit) {
     disp2.fillRect(0, 160, 172, 160, TFT_BLACK);
     disp2.drawFastHLine(0, 160, 172, 0x4208);
     navBottomInit = true;
+    prevTurnDir = -99;
   }
 
   float hdgDeg = liveData.heading_deg;
@@ -700,26 +725,73 @@ void renderD2Navigation() {
   // Redraw arrow only when direction or urgency changes
   int arrowCx = 86, arrowCy = 210;
   int8_t effectiveDir = (turnDir == 0 || turnDist > 50) ? 0 : turnDir;
-  if (effectiveDir != prevTurnDir || turnUrgent != prevTurnUrgent) {
-    disp2.fillRect(0, 175, 172, 90, TFT_BLACK);  // clear arrow + label area
-    if (effectiveDir == 0) {
-      uint16_t c = TFT_GREEN;
-      disp2.fillTriangle(arrowCx, arrowCy - 30, arrowCx - 15, arrowCy, arrowCx + 15, arrowCy, c);
-      disp2.fillRect(arrowCx - 6, arrowCy, 12, 20, c);
-      disp2.setTextColor(c); disp2.setCursor(48, 250); disp2.setTextSize(2); disp2.print("AHEAD");
-    } else if (effectiveDir > 0) {
-      uint16_t c = turnUrgent ? TFT_RED : TFT_YELLOW;
-      disp2.fillTriangle(arrowCx + 30, arrowCy, arrowCx, arrowCy - 15, arrowCx, arrowCy + 15, c);
-      disp2.fillRect(arrowCx - 20, arrowCy - 6, 20, 12, c);
-      disp2.setTextColor(c); disp2.setCursor(42, 250); disp2.setTextSize(2); disp2.print("RIGHT");
-    } else {
-      uint16_t c = turnUrgent ? TFT_RED : TFT_YELLOW;
-      disp2.fillTriangle(arrowCx - 30, arrowCy, arrowCx, arrowCy - 15, arrowCx, arrowCy + 15, c);
-      disp2.fillRect(arrowCx, arrowCy - 6, 20, 12, c);
-      disp2.setTextColor(c); disp2.setCursor(48, 250); disp2.setTextSize(2); disp2.print("LEFT");
+
+  // Waiting for GPS overrides the arrow area
+  static bool prevWaiting = false;
+  if (navRoute.active && navRoute.waitingForGPS) {
+    disp2.fillRect(0, 175, 172, 90, TFT_BLACK);
+
+    // Pulsing ring
+    float pulse = (sinf(millis() * 0.004f) + 1.0f) * 0.5f;
+    uint8_t br = (uint8_t)(80 + 175 * pulse);
+    uint16_t ringCol = disp2.color565(0, br, br);
+    disp2.drawCircle(arrowCx, arrowCy, 32, ringCol);
+    disp2.drawCircle(arrowCx, arrowCy, 33, ringCol);
+
+    // Arrow pointing toward start
+    float bearRad = navRoute.startBearingDeg * PI / 180.0f;
+    int tipX = arrowCx + (int)(26.0f * sinf(bearRad));
+    int tipY = arrowCy - (int)(26.0f * cosf(bearRad));
+    int bx1 = arrowCx + (int)(10.0f * sinf(bearRad + 2.5f));
+    int by1 = arrowCy - (int)(10.0f * cosf(bearRad + 2.5f));
+    int bx2 = arrowCx + (int)(10.0f * sinf(bearRad - 2.5f));
+    int by2 = arrowCy - (int)(10.0f * cosf(bearRad - 2.5f));
+    uint16_t arrowCol = ((millis() / 500) % 2) ? TFT_CYAN : disp2.color565(0, 100, 100);
+    disp2.fillTriangle(tipX, tipY, bx1, by1, bx2, by2, arrowCol);
+
+    // "GO TO START" label
+    disp2.setTextSize(2);
+    disp2.setTextColor(((millis() / 600) % 2) ? TFT_WHITE : 0x6B6D);
+    disp2.setCursor(16, 252);
+    disp2.print("GO TO START");
+
+    // Distance
+    disp2.setTextSize(1);
+    disp2.setTextColor(TFT_CYAN);
+    disp2.setCursor(50, 272);
+    if (navRoute.startDistM < 1000)
+      disp2.printf("%.0fm away", navRoute.startDistM);
+    else
+      disp2.printf("%.1fkm away", navRoute.startDistM / 1000.0f);
+
+    prevTurnDir = -99;  // force redraw when nav starts
+    prevWaiting = true;
+  } else {
+    if (prevWaiting) {
+      prevWaiting = false;
+      prevTurnDir = -99;  // force redraw after leaving waiting state
     }
-    prevTurnDir = effectiveDir;
-    prevTurnUrgent = turnUrgent;
+    if (effectiveDir != prevTurnDir || turnUrgent != prevTurnUrgent) {
+      disp2.fillRect(0, 175, 172, 90, TFT_BLACK);  // clear arrow + label area
+      if (effectiveDir == 0) {
+        uint16_t c = TFT_GREEN;
+        disp2.fillTriangle(arrowCx, arrowCy - 30, arrowCx - 15, arrowCy, arrowCx + 15, arrowCy, c);
+        disp2.fillRect(arrowCx - 6, arrowCy, 12, 20, c);
+        disp2.setTextColor(c); disp2.setCursor(48, 250); disp2.setTextSize(2); disp2.print("AHEAD");
+      } else if (effectiveDir > 0) {
+        uint16_t c = turnUrgent ? TFT_RED : TFT_YELLOW;
+        disp2.fillTriangle(arrowCx + 30, arrowCy, arrowCx, arrowCy - 15, arrowCx, arrowCy + 15, c);
+        disp2.fillRect(arrowCx - 20, arrowCy - 6, 20, 12, c);
+        disp2.setTextColor(c); disp2.setCursor(42, 250); disp2.setTextSize(2); disp2.print("RIGHT");
+      } else {
+        uint16_t c = turnUrgent ? TFT_RED : TFT_YELLOW;
+        disp2.fillTriangle(arrowCx - 30, arrowCy, arrowCx, arrowCy - 15, arrowCx, arrowCy + 15, c);
+        disp2.fillRect(arrowCx, arrowCy - 6, 20, 12, c);
+        disp2.setTextColor(c); disp2.setCursor(48, 250); disp2.setTextSize(2); disp2.print("LEFT");
+      }
+      prevTurnDir = effectiveDir;
+      prevTurnUrgent = turnUrgent;
+    }
   }
 
   // Text rows — clear and redraw each row (narrow strips, minimal flash)
@@ -728,7 +800,8 @@ void renderD2Navigation() {
   // Row 1: route remaining + speed
   disp2.fillRect(0, 168, 172, 10, TFT_BLACK);
   disp2.setTextColor(TFT_WHITE); disp2.setCursor(8, 170);
-  if (navRoute.active) disp2.printf("REM: %.0fm", navRoute.remainingDistM);
+  if (navRoute.active && navRoute.waitingForGPS) disp2.printf("WAIT: %s", navRoute.name);
+  else if (navRoute.active) disp2.printf("REM: %.0fm", navRoute.remainingDistM);
   else disp2.print("No route");
   disp2.setCursor(100, 170); disp2.setTextColor(TFT_GREEN); disp2.printf("%.0f", kmh);
   disp2.setTextColor(0xC618); disp2.print(" km/h");
@@ -1023,7 +1096,41 @@ void renderD1Navigation() {
   // ── Center: Navigation arrow (30..104) with padding ──
   int ax = 68, ay = 56;
 
-  if (turnDir == 0 || turnDist > 50) {
+  if (navRoute.active && navRoute.waitingForGPS) {
+    // ── Waiting for GPS at start point ──
+    // Pulsing ring
+    float pulse = (sinf(millis() * 0.004f) + 1.0f) * 0.5f;  // 0..1
+    uint8_t brightness = (uint8_t)(80 + 175 * pulse);
+    uint16_t ringCol = sprite1.color565(0, brightness, brightness);
+    sprite1.drawCircle(ax, ay, 28, ringCol);
+    sprite1.drawCircle(ax, ay, 29, ringCol);
+    sprite1.drawCircle(ax, ay, 30, ringCol);
+
+    // Arrow pointing toward start point
+    float bearRad = navRoute.startBearingDeg * PI / 180.0f;
+    int tipX = ax + (int)(22.0f * sinf(bearRad));
+    int tipY = ay - (int)(22.0f * cosf(bearRad));
+    int baseX1 = ax + (int)(8.0f * sinf(bearRad + 2.5f));
+    int baseY1 = ay - (int)(8.0f * cosf(bearRad + 2.5f));
+    int baseX2 = ax + (int)(8.0f * sinf(bearRad - 2.5f));
+    int baseY2 = ay - (int)(8.0f * cosf(bearRad - 2.5f));
+    uint16_t arrowCol = ((millis() / 500) % 2) ? TFT_CYAN : sprite1.color565(0, 100, 100);
+    sprite1.fillTriangle(tipX, tipY, baseX1, baseY1, baseX2, baseY2, arrowCol);
+
+    // Distance text
+    sprite1.setTextColor(TFT_CYAN);
+    sprite1.setTextSize(1);
+    sprite1.setCursor(36, 100);
+    if (navRoute.startDistM < 1000)
+      sprite1.printf("%.0fm away", navRoute.startDistM);
+    else
+      sprite1.printf("%.1fkm", navRoute.startDistM / 1000.0f);
+
+    // "GO TO START" label
+    sprite1.setTextColor(((millis() / 600) % 2) ? TFT_WHITE : 0x6B6D);
+    sprite1.setCursor(34, 115);
+    sprite1.print("GO TO START");
+  } else if (turnDir == 0 || turnDist > 50) {
     // Straight
     sprite1.fillTriangle(ax, ay - 35, ax - 18, ay + 5, ax + 18, ay + 5, TFT_GREEN);
     sprite1.fillRect(ax - 8, ay + 5, 16, 24, TFT_GREEN);
@@ -1052,13 +1159,15 @@ void renderD1Navigation() {
   }
 
   // Turn distance from route engine
-  sprite1.setTextColor(TFT_WHITE);
-  sprite1.setTextSize(1);
-  sprite1.setCursor(36, 115);
-  if (navRoute.active && turnDir != 0) {
-    sprite1.printf("%.0fm", turnDist);
-  } else if (navRoute.active) {
-    sprite1.printf("%.0fm left", navRoute.remainingDistM);
+  if (!navRoute.waitingForGPS) {
+    sprite1.setTextColor(TFT_WHITE);
+    sprite1.setTextSize(1);
+    sprite1.setCursor(36, 115);
+    if (navRoute.active && turnDir != 0) {
+      sprite1.printf("%.0fm", turnDist);
+    } else if (navRoute.active) {
+      sprite1.printf("%.0fm left", navRoute.remainingDistM);
+    }
   }
 
   // ── Right: Compass (105..239) ──
@@ -2721,7 +2830,7 @@ void loop() {
       }
     }
 
-    updateSim();
+    if (!navRoute.waitingForGPS) updateSim();
     updateMediaState();
 
     // Navigation update at 2Hz
@@ -2735,7 +2844,7 @@ void loop() {
     }
 
     // Populate LiveData: from I2C master if present, otherwise from simulation
-    if (!liveData.masterPresent) {
+    if (!liveData.masterPresent && !navRoute.waitingForGPS) {
       updateLiveDataFromSim();
     }
 

@@ -46,6 +46,9 @@ struct NavRoute {
   bool offRoute;
   bool active;
   bool finished;
+  bool waitingForGPS;        // waiting at start point for GPS match
+  float startBearingDeg;     // bearing from GPS to start point
+  float startDistM;          // distance from GPS to start point
   char name[16];
 
   // Flat-earth constants (computed once at load)
@@ -249,6 +252,22 @@ void updateNavigation(int32_t gpsLat, int32_t gpsLon) {
   float mLat = navRoute.mPerDegLat;
   float mLon = navRoute.mPerDegLon;
 
+  // ── Waiting for GPS at start point ──
+  if (navRoute.waitingForGPS) {
+    RoutePoint gps = {gpsLat, gpsLon};
+    RoutePoint start = navRoute.pts[0];
+    float dx = (gps.lon - start.lon) * mLon;
+    float dy = (gps.lat - start.lat) * mLat;
+    navRoute.startDistM = sqrtf(dx * dx + dy * dy);
+    navRoute.startBearingDeg = bearingDeg(gps, start, mLat, mLon);
+    // Start when within 15 meters of start point
+    if (navRoute.startDistM < 15.0f) {
+      navRoute.waitingForGPS = false;
+      Serial.println("Nav: GPS reached start — GO!");
+    }
+    return;
+  }
+
   // Find nearest segment (search window around current position)
   int searchStart = max(0, (int)navRoute.currentIdx - 5);
   int searchEnd = min((int)navRoute.count - 2, (int)navRoute.currentIdx + 30);
@@ -361,12 +380,13 @@ enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_COUNT };
 static const char* menuL1Names[] = {"Screen Select", "Navigation"};
 
 // Screen Select sub-items
-enum MenuL2Screen { ML2S_DISPLAY1 = 0, ML2S_COUNT };
-static const char* menuL2ScreenNames[] = {"Display 1"};
+enum MenuL2Screen { ML2S_DISPLAY1 = 0, ML2S_DISPLAY2, ML2S_COUNT };
+static const char* menuL2ScreenNames[] = {"Display 1", "Display 2"};
 
 // Navigation sub-items
-enum MenuL2Nav { ML2N_TRACK_SEL = 0, ML2N_COUNT };
-static const char* menuL2NavNames[] = {"Track Select"};
+enum MenuL2Nav { ML2N_TRACK_SEL = 0, ML2N_RESTART_NAV, ML2N_STOP_NAV, ML2N_PREVIEW, ML2N_COUNT };
+static const char* menuL2NavNames[] = {"Track Select", "(Re)Start Nav", "Stop Nav", "Track Preview"};
+static const char* menuL2NavPreviewStop = "Stop Preview";
 
 struct Menu {
   MenuLevel level;
@@ -426,19 +446,21 @@ void scanTracks() {
 
 bool menuIsActive() { return menu.level != MENU_CLOSED; }
 
-void menuBack();  // forward declaration
+void menuBack();   // forward declaration
+void menuEnter();  // forward declaration
 
 void menuOpen() {
-  if (menu.level != MENU_CLOSED) return;
+  if (menu.level != MENU_CLOSED) {
+    menuEnter();  // already open — act as enter
+    return;
+  }
   menu.level = MENU_L1;
   menu.l1Idx = 0;
-  menu.previewMode = false;
   Serial.println("Menu opened");
 }
 
 void menuClose() {
   menu.level = MENU_CLOSED;
-  menu.previewMode = false;
   Serial.println("Menu closed");
 }
 
@@ -451,8 +473,10 @@ static int menuItemCount() {
       if (menu.l1Parent == ML1_NAVIGATION) return ML2N_COUNT;
       return 0;
     case MENU_L3:
-      if (menu.l1Parent == ML1_SCREEN_SEL && menu.l2Parent == ML2S_DISPLAY1)
-        return D1_SCREEN_COUNT;
+      if (menu.l1Parent == ML1_SCREEN_SEL) {
+        if (menu.l2Parent == ML2S_DISPLAY1) return D1_SCREEN_COUNT;
+        if (menu.l2Parent == ML2S_DISPLAY2) return D2_SCREEN_COUNT;
+      }
       if (menu.l1Parent == ML1_NAVIGATION && menu.l2Parent == ML2N_TRACK_SEL)
         return menu.trackCount;
       return 0;
@@ -488,6 +512,12 @@ void menuPrev() {
   *idx = (*idx - 1 + total) % total;
 }
 
+// Forward declarations
+void startNavigation();
+void stopNavigation();
+void startPreview();
+void stopPreview();
+
 void menuEnter() {
   if (menu.level == MENU_CLOSED) return;
 
@@ -508,6 +538,24 @@ void menuEnter() {
   }
 
   if (menu.level == MENU_L2) {
+    // Action items (no L3) — execute and close
+    if (menu.l1Parent == ML1_NAVIGATION && menu.l2Idx == ML2N_RESTART_NAV) {
+      if (menu.previewMode) stopPreview();
+      startNavigation();
+      menuClose();
+      return;
+    }
+    if (menu.l1Parent == ML1_NAVIGATION && menu.l2Idx == ML2N_STOP_NAV) {
+      stopNavigation();
+      menuClose();
+      return;
+    }
+    if (menu.l1Parent == ML1_NAVIGATION && menu.l2Idx == ML2N_PREVIEW) {
+      if (menu.previewMode) stopPreview(); else startPreview();
+      menuClose();
+      return;
+    }
+    // Sub-menu items — enter L3
     menu.l2Parent = menu.l2Idx;
     menu.l3Idx = 0;
     if (menu.l1Parent == ML1_NAVIGATION && menu.l2Parent == ML2N_TRACK_SEL) {
@@ -526,6 +574,16 @@ void menuEnter() {
         d1Screen = (D1Screen)menu.l3Idx;
         saveScreenState();
         Serial.printf("D1 -> %s\n", d1ScreenNames[menu.l3Idx]);
+        menuClose();
+      }
+    } else if (menu.l1Parent == ML1_SCREEN_SEL && menu.l2Parent == ML2S_DISPLAY2) {
+      extern D2Screen d2Screen;
+      extern void saveScreenState();
+      extern const char* d2ScreenNames[];
+      if (menu.l3Idx >= 0 && menu.l3Idx < D2_SCREEN_COUNT) {
+        d2Screen = (D2Screen)menu.l3Idx;
+        saveScreenState();
+        Serial.printf("D2 -> %s\n", d2ScreenNames[menu.l3Idx]);
         menuClose();
       }
     } else if (menu.l1Parent == ML1_NAVIGATION && menu.l2Parent == ML2N_TRACK_SEL) {
@@ -558,14 +616,42 @@ void trackSelectPrev()     { menuPrev(); }
 void trackConfirmSelection() { menuEnter(); }
 
 void startNavigation() {
-  if (navRoute.active) {
-    navRoute.currentIdx = 0;
-    navRoute.finished = false;
-    navRoute.projDistM = 0;
-    Serial.println("Navigation started/restarted");
-  } else {
+  if (!navRoute.active || navRoute.count < 2) {
     Serial.println("No route loaded");
+    return;
   }
+  navRoute.currentIdx = 0;
+  navRoute.finished = false;
+  navRoute.projDistM = 0;
+  navRoute.waitingForGPS = true;
+  navRoute.startDistM = 9999;
+  navRoute.startBearingDeg = 0;
+
+  // Center map on first route point
+  extern float simX, simY, simHeading;
+  int n = 1 << TILE_ZOOM;
+  float startLat = navRoute.pts[0].lat / 1e7;
+  float startLon = navRoute.pts[0].lon / 1e7;
+  float tileX = (startLon + 180.0f) / 360.0f * n;
+  float latRad = startLat * PI / 180.0f;
+  float tileY = (1.0f - logf(tanf(latRad) + 1.0f / cosf(latRad)) / PI) / 2.0f * n;
+  simX = (tileX - GRID_X0) * TPX;
+  simY = (tileY - GRID_Y0) * TPX;
+
+  // Heading toward second point
+  simHeading = bearingDeg(navRoute.pts[0], navRoute.pts[1],
+                           navRoute.mPerDegLat, navRoute.mPerDegLon) * PI / 180.0f;
+
+  Serial.printf("Nav started: waiting for GPS near start (%s)\n", navRoute.name);
+}
+
+void stopNavigation() {
+  navRoute.waitingForGPS = false;
+  navRoute.currentIdx = 0;
+  navRoute.finished = true;
+  navRoute.projDistM = 0;
+  navRoute.remainingDistM = 0;
+  Serial.println("Navigation stopped");
 }
 
 void startPreview() {
@@ -661,45 +747,48 @@ void updatePreview() {
 
 extern LGFX_Sprite sprite1;
 
-// Helper: draw a menu list with title, items, selected index, and optional back
+// Flags for which L2 items are actions (no L3 submenu)
+static bool menuL2IsAction(int l1, int l2) {
+  return (l1 == ML1_NAVIGATION && (l2 == ML2N_RESTART_NAV || l2 == ML2N_STOP_NAV || l2 == ML2N_PREVIEW));
+}
+
+// Helper: draw a menu list (2x font, 240x135 landscape)
+// itemH=24px, title=18px, bottom bar=14px → 4 visible items
 static void drawMenuList(const char* title, const char** items, int count,
-                         int selIdx, bool showBack, const char* breadcrumb) {
+                         int selIdx, const char* breadcrumb) {
   sprite1.fillScreen(TFT_BLACK);
 
-  // Title bar
-  sprite1.fillRect(0, 0, 240, 14, 0x0841);
-  sprite1.setTextColor(TFT_CYAN);
+  // Title bar (size 1 for breadcrumb + title)
+  sprite1.fillRect(0, 0, 240, 16, 0x0841);
   sprite1.setTextSize(1);
-  // Breadcrumb on left
   if (breadcrumb) {
-    sprite1.setCursor(4, 3);
     sprite1.setTextColor(0x4A69);
+    sprite1.setCursor(4, 4);
     sprite1.print(breadcrumb);
     sprite1.setTextColor(TFT_CYAN);
+    sprite1.print(" > ");
+  } else {
+    sprite1.setTextColor(TFT_CYAN);
+    sprite1.setCursor(4, 4);
   }
-  // Title centered
-  int tw = strlen(title) * 6;
-  sprite1.setCursor((240 - tw) / 2, 3);
   sprite1.print(title);
 
   // Preview indicator
   if (menu.previewMode) {
-    bool blink = (millis() / 400) % 2;
-    if (blink) sprite1.fillCircle(230, 7, 4, TFT_RED);
+    if ((millis() / 400) % 2) sprite1.fillCircle(230, 8, 4, TFT_RED);
   }
 
-  // Total items = count + back button (if shown)
-  int totalItems = count + (showBack ? 1 : 0);
-  if (totalItems == 0) {
+  // Items area: y=18..120 (102px), item height=24, max 4 visible
+  int totalItems = count + 1;  // +1 for Back/Exit
+  sprite1.setTextSize(2);  // 12x16 chars
+
+  if (count == 0 && menu.level == MENU_L3) {
     sprite1.setTextColor(0x8410);
-    sprite1.setCursor(60, 55);
+    sprite1.setCursor(30, 50);
     sprite1.print("(empty)");
-    sprite1.pushSprite(0, 0);
-    return;
   }
 
-  // Scrolling: show up to 6 items centered on selection
-  int maxVis = 6;
+  int maxVis = 4;
   int visCount = min(maxVis, totalItems);
   int startIdx = selIdx - visCount / 2;
   if (startIdx < 0) startIdx = 0;
@@ -707,60 +796,81 @@ static void drawMenuList(const char* title, const char** items, int count,
 
   for (int i = 0; i < visCount; i++) {
     int idx = startIdx + i;
-    int y = 18 + i * 16;
+    int y = 18 + i * 24;
     bool selected = (idx == selIdx);
 
     if (selected) {
-      sprite1.fillRect(4, y, 232, 15, 0x0841);
-      sprite1.drawRect(4, y, 232, 15, TFT_CYAN);
+      sprite1.fillRect(2, y, 236, 22, 0x0841);
+      sprite1.drawRect(2, y, 236, 22, TFT_CYAN);
       sprite1.setTextColor(TFT_WHITE);
     } else {
       sprite1.setTextColor(0x8410);
     }
 
-    sprite1.setCursor(12, y + 3);
+    sprite1.setCursor(8, y + 3);
     if (idx < count) {
       sprite1.print(items[idx]);
-      // Arrow for items that open sub-menus
-      if (menu.level < MENU_L3) {
+      // Arrow ">" for submenu items, no arrow for actions
+      bool hasSubmenu = (menu.level < MENU_L3) && !menuL2IsAction(menu.l1Parent, idx);
+      if (hasSubmenu && menu.level != MENU_L1) {
         sprite1.setTextColor(selected ? 0x6B6D : 0x4208);
-        sprite1.setCursor(220, y + 3);
+        sprite1.setCursor(224, y + 3);
+        sprite1.print(">");
+      }
+      if (menu.level == MENU_L1) {
+        sprite1.setTextColor(selected ? 0x6B6D : 0x4208);
+        sprite1.setCursor(224, y + 3);
         sprite1.print(">");
       }
     } else {
-      // Back / Exit button
       sprite1.setTextColor(selected ? TFT_ORANGE : 0x6B6D);
       sprite1.print(menu.level == MENU_L1 ? "< Exit" : "< Back");
     }
   }
 
+  // Scroll indicators
+  sprite1.setTextSize(1);
+  if (startIdx > 0) {
+    sprite1.setTextColor(0x4A69);
+    sprite1.setCursor(116, 17);
+    sprite1.print("^");
+  }
+  if (startIdx + visCount < totalItems) {
+    sprite1.setTextColor(0x4A69);
+    sprite1.setCursor(116, 115);
+    sprite1.print("v");
+  }
+
   // Bottom hint bar
-  sprite1.fillRect(0, 120, 240, 15, 0x0841);
+  sprite1.fillRect(0, 122, 240, 13, 0x0841);
   sprite1.setTextColor(0x4A69);
-  sprite1.setCursor(6, 123);
-  sprite1.print("UP/DN:browse  OK:select  BACK:return");
+  sprite1.setTextSize(1);
+  sprite1.setCursor(20, 125);
+  sprite1.print("UP/DN:browse  OK:select  BACK:up");
 
   sprite1.pushSprite(0, 0);
 }
 
 void renderD1Menu() {
   extern const char* d1ScreenNames[];
+  extern const char* d2ScreenNames[];
 
   if (menu.level == MENU_L1) {
-    // Back item acts as Exit
-    int sel = menu.l1Idx;
-    drawMenuList("MENU", menuL1Names, ML1_COUNT, sel, true, NULL);
+    drawMenuList("MENU", menuL1Names, ML1_COUNT, menu.l1Idx, NULL);
     return;
   }
 
   if (menu.level == MENU_L2) {
-    const char* parent = menuL1Names[menu.l1Parent];
     if (menu.l1Parent == ML1_SCREEN_SEL) {
-      drawMenuList("SCREEN SELECT", menuL2ScreenNames, ML2S_COUNT,
-                   menu.l2Idx, true, parent);
+      drawMenuList("SCREENS", menuL2ScreenNames, ML2S_COUNT,
+                   menu.l2Idx, "Screen Sel");
     } else if (menu.l1Parent == ML1_NAVIGATION) {
-      drawMenuList("NAVIGATION", menuL2NavNames, ML2N_COUNT,
-                   menu.l2Idx, true, parent);
+      // Dynamic label for preview item
+      const char* navNames[ML2N_COUNT];
+      for (int i = 0; i < ML2N_COUNT; i++) navNames[i] = menuL2NavNames[i];
+      if (menu.previewMode) navNames[ML2N_PREVIEW] = menuL2NavPreviewStop;
+      drawMenuList("NAVIGATION", navNames, ML2N_COUNT,
+                   menu.l2Idx, "Nav");
     }
     return;
   }
@@ -768,36 +878,37 @@ void renderD1Menu() {
   if (menu.level == MENU_L3) {
     if (menu.l1Parent == ML1_SCREEN_SEL && menu.l2Parent == ML2S_DISPLAY1) {
       drawMenuList("DISPLAY 1", d1ScreenNames, D1_SCREEN_COUNT,
-                   menu.l3Idx, true, "Screen Sel");
+                   menu.l3Idx, "Screens");
+    } else if (menu.l1Parent == ML1_SCREEN_SEL && menu.l2Parent == ML2S_DISPLAY2) {
+      drawMenuList("DISPLAY 2", d2ScreenNames, D2_SCREEN_COUNT,
+                   menu.l3Idx, "Screens");
     } else if (menu.l1Parent == ML1_NAVIGATION && menu.l2Parent == ML2N_TRACK_SEL) {
-      // Build track name pointers
-      const char* tnames[MAX_TRACK_LIST];
-      for (int i = 0; i < menu.trackCount; i++) tnames[i] = menu.names[i];
-
-      // Custom rendering for tracks (with distances)
+      // Track list with distances — custom rendering
       sprite1.fillScreen(TFT_BLACK);
-      sprite1.fillRect(0, 0, 240, 14, 0x0841);
+      sprite1.fillRect(0, 0, 240, 16, 0x0841);
+      sprite1.setTextSize(1);
       sprite1.setTextColor(0x4A69);
-      sprite1.setCursor(4, 3);
-      sprite1.print("Nav");
+      sprite1.setCursor(4, 4);
+      sprite1.print("Nav > ");
       sprite1.setTextColor(TFT_CYAN);
-      sprite1.setCursor(80, 3);
-      sprite1.print("SELECT TRACK");
+      sprite1.print("TRACKS");
 
       if (menu.previewMode) {
-        bool blink = (millis() / 400) % 2;
-        if (blink) sprite1.fillCircle(230, 7, 4, TFT_RED);
+        if ((millis() / 400) % 2) sprite1.fillCircle(230, 8, 4, TFT_RED);
       }
 
-      int totalItems = menu.trackCount + 1;  // +1 for Back
+      int totalItems = menu.trackCount + 1;
+      sprite1.setTextSize(2);
+
       if (menu.trackCount == 0) {
         sprite1.setTextColor(0x8410);
-        sprite1.setCursor(40, 50);
-        sprite1.print("No routes found");
-        sprite1.setCursor(30, 68);
-        sprite1.print("Use web UI to create");
+        sprite1.setCursor(18, 45);
+        sprite1.print("No routes");
+        sprite1.setCursor(18, 68);
+        sprite1.setTextSize(1);
+        sprite1.print("Use web UI to upload");
       } else {
-        int maxVis = 6;
+        int maxVis = 4;
         int visCount = min(maxVis, totalItems);
         int startIdx = menu.l3Idx - visCount / 2;
         if (startIdx < 0) startIdx = 0;
@@ -805,34 +916,51 @@ void renderD1Menu() {
 
         for (int i = 0; i < visCount; i++) {
           int idx = startIdx + i;
-          int y = 18 + i * 16;
+          int y = 18 + i * 24;
           bool selected = (idx == menu.l3Idx);
           if (selected) {
-            sprite1.fillRect(4, y, 232, 15, 0x0841);
-            sprite1.drawRect(4, y, 232, 15, TFT_CYAN);
+            sprite1.fillRect(2, y, 236, 22, 0x0841);
+            sprite1.drawRect(2, y, 236, 22, TFT_CYAN);
             sprite1.setTextColor(TFT_WHITE);
           } else {
             sprite1.setTextColor(0x8410);
           }
-          sprite1.setCursor(12, y + 3);
+          sprite1.setTextSize(2);
+          sprite1.setCursor(8, y + 3);
           if (idx < menu.trackCount) {
-            sprite1.printf("%d. %s", idx + 1, menu.names[idx]);
+            sprite1.print(menu.names[idx]);
+            // Distance in small font on right
             int dist = menu.distances[idx];
-            sprite1.setCursor(180, y + 3);
+            sprite1.setTextSize(1);
             sprite1.setTextColor(selected ? 0x6B6D : 0x4208);
-            if (dist < 1000) sprite1.printf("%4dm", dist);
+            sprite1.setCursor(190, y + 7);
+            if (dist < 1000) sprite1.printf("%dm", dist);
             else sprite1.printf("%.1fkm", dist / 1000.0f);
           } else {
             sprite1.setTextColor(selected ? TFT_ORANGE : 0x6B6D);
             sprite1.print("< Back");
           }
         }
+
+        // Scroll indicators
+        sprite1.setTextSize(1);
+        if (startIdx > 0) {
+          sprite1.setTextColor(0x4A69);
+          sprite1.setCursor(116, 17);
+          sprite1.print("^");
+        }
+        if (startIdx + visCount < totalItems) {
+          sprite1.setTextColor(0x4A69);
+          sprite1.setCursor(116, 115);
+          sprite1.print("v");
+        }
       }
 
-      sprite1.fillRect(0, 120, 240, 15, 0x0841);
+      sprite1.fillRect(0, 122, 240, 13, 0x0841);
       sprite1.setTextColor(0x4A69);
-      sprite1.setCursor(6, 123);
-      sprite1.print("UP/DN:browse  OK:select  np:preview");
+      sprite1.setTextSize(1);
+      sprite1.setCursor(20, 125);
+      sprite1.print("UP/DN:browse  OK:select  BACK:up");
       sprite1.pushSprite(0, 0);
     }
   }
