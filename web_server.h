@@ -2,7 +2,7 @@
 #include <WebServer.h>
 #include <SD.h>
 #include <WiFi.h>
-#include "web_ui.h"
+// web_ui.h removed — index.html now served from SD card
 
 WebServer webServer(80);
 
@@ -37,8 +37,23 @@ void sdRelease() {
 // ─── Route handlers ──────────────────────────────────────────────────────────
 
 void handleRoot() {
-  webServer.sendHeader("Content-Encoding", "gzip");
-  webServer.send_P(200, "text/html", (const char*)index_html_gz, index_html_gz_len);
+  sdAcquire();
+  File f = SD.open("/web/index.html", FILE_READ);
+  if (!f) {
+    sdRelease();
+    webServer.send(404, "text/plain", "index.html not found on SD (expected /web/index.html)");
+    return;
+  }
+  size_t fsize = f.size();
+  webServer.setContentLength(fsize);
+  webServer.send(200, "text/html", "");
+  uint8_t buf[512];
+  while (f.available()) {
+    int len = f.read(buf, sizeof(buf));
+    webServer.sendContent((const char*)buf, len);
+  }
+  f.close();
+  sdRelease();
 }
 
 void handleListTiles() {
@@ -473,8 +488,123 @@ void handleRouteDelete() {
   snprintf(path, sizeof(path), "/routes/%s", fname.c_str());
   sdAcquire();
   bool ok = SD.remove(path);
+  // Also delete associated image files
+  String base = fname;
+  if (base.endsWith(".rte")) base = base.substring(0, base.length() - 4);
+  char imgPath[64];
+  snprintf(imgPath, sizeof(imgPath), "/routes/%s_map.png", base.c_str());
+  SD.remove(imgPath);
+  snprintf(imgPath, sizeof(imgPath), "/routes/%s_path.png", base.c_str());
+  SD.remove(imgPath);
+  snprintf(imgPath, sizeof(imgPath), "/routes/%s_thumb.png", base.c_str());
+  SD.remove(imgPath);
   sdRelease();
   webServer.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+// Binary image upload — JS sends as ArrayBuffer via fetch body
+// We use the trick: send as base64 in JSON to avoid binary issues with ESP32 WebServer
+// Actually: use webServer.arg("plain") which gives us the raw body as String.
+// For binary, JS will encode to base64 and we'll decode here.
+
+static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static int b64val(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+void handleRouteImageUpload() {
+  String name = webServer.arg("name");
+  if (name.length() == 0) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"missing name\"}");
+    return;
+  }
+  for (int i = 0; i < (int)name.length(); i++) {
+    char c = name[i];
+    if (!isalnum(c) && c != '_' && c != '-' && c != '.') {
+      webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"bad name\"}");
+      return;
+    }
+  }
+
+  // Body is base64-encoded PNG
+  String b64 = webServer.arg("plain");
+  if (b64.length() < 10) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"no data\"}");
+    return;
+  }
+
+  char path[64];
+  snprintf(path, sizeof(path), "/routes/%s", name.c_str());
+
+  sdAcquire();
+  SD.mkdir("/routes");
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) {
+    sdRelease();
+    webServer.send(500, "application/json", "{\"ok\":false,\"error\":\"file create failed\"}");
+    return;
+  }
+
+  // Decode base64 and write in chunks
+  const char* src = b64.c_str();
+  int srcLen = b64.length();
+  uint8_t buf[3];
+  int written = 0;
+  for (int i = 0; i < srcLen; ) {
+    int a = (i < srcLen) ? b64val(src[i++]) : 0;
+    int b = (i < srcLen) ? b64val(src[i++]) : 0;
+    int c = (i < srcLen) ? b64val(src[i++]) : 0;
+    int d = (i < srcLen) ? b64val(src[i++]) : 0;
+    if (a < 0) a = 0; if (b < 0) b = 0; if (c < 0) c = 0; if (d < 0) d = 0;
+    buf[0] = (a << 2) | (b >> 4);
+    buf[1] = (b << 4) | (c >> 2);
+    buf[2] = (c << 6) | d;
+    int n = 3;
+    if (srcLen > 1 && src[srcLen-1] == '=') n--;
+    if (srcLen > 2 && src[srcLen-2] == '=') n--;
+    // Only adjust for last quad
+    if (i >= srcLen) f.write(buf, n); else f.write(buf, 3);
+    written += (i >= srcLen) ? n : 3;
+  }
+  f.close();
+  sdRelease();
+
+  Serial.printf("Route image saved: %s (%d bytes)\n", path, written);
+  webServer.send(200, "application/json", "{\"ok\":true,\"size\":" + String(written) + "}");
+}
+
+void handleRouteImageGet() {
+  String name = webServer.arg("name");
+  if (name.length() == 0) {
+    webServer.send(400, "text/plain", "missing name");
+    return;
+  }
+
+  char path[64];
+  snprintf(path, sizeof(path), "/routes/%s", name.c_str());
+
+  sdAcquire();
+  File f = SD.open(path, FILE_READ);
+  if (!f) {
+    sdRelease();
+    webServer.send(404, "text/plain", "not found");
+    return;
+  }
+  size_t fsize = f.size();
+  webServer.setContentLength(fsize);
+  webServer.send(200, "image/png", "");
+  uint8_t buf[512];
+  while (f.available()) {
+    int rd = f.read(buf, sizeof(buf));
+    webServer.sendContent((const char*)buf, rd);
+  }
+  f.close();
+  sdRelease();
 }
 
 // Serve route editor HTML from SD
@@ -511,6 +641,63 @@ void handleNotFound() {
   webServer.send(404, "text/plain", "Not found");
 }
 
+// ─── Song list API ──────────────────────────────────────────────────────────
+
+void handleSongsGet() {
+  sdAcquire();
+  File f = SD.open("/music/songs.txt", FILE_READ);
+  if (!f) {
+    sdRelease();
+    webServer.send(200, "text/plain", "");
+    return;
+  }
+  String content = f.readString();
+  f.close();
+  sdRelease();
+  webServer.send(200, "text/plain", content);
+}
+
+void handleSongsSave() {
+  String body = webServer.arg("plain");
+  sdAcquire();
+  SD.mkdir("/music");
+  File f = SD.open("/music/songs.txt", FILE_WRITE);
+  if (!f) {
+    sdRelease();
+    webServer.send(500, "application/json", "{\"ok\":false,\"error\":\"write failed\"}");
+    return;
+  }
+  f.print(body);
+  f.close();
+  sdRelease();
+
+  // Reload song list in memory
+  extern void loadSongList();
+  loadSongList();
+
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleSongsEditor() {
+  sdAcquire();
+  File f = SD.open("/web/songs.html", FILE_READ);
+  if (!f) {
+    sdRelease();
+    webServer.send(404, "text/plain", "songs.html not found on SD (expected /web/songs.html)");
+    return;
+  }
+  size_t fsize = f.size();
+  webServer.setContentLength(fsize);
+  webServer.send(200, "text/html", "");
+  uint8_t buf[512];
+  while (f.available()) {
+    int len = f.read(buf, sizeof(buf));
+    webServer.sendContent((const char*)buf, len);
+  }
+  f.close();
+  sdRelease();
+}
+
 // Setup all routes
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleRoot);
@@ -528,7 +715,12 @@ void setupWebServer() {
   webServer.on("/api/routes/points", HTTP_POST, handleRoutePoints);
   webServer.on("/api/routes/finish", HTTP_POST, handleRouteFinish);
   webServer.on("/api/routes/activate", HTTP_POST, handleRouteActivate);
+  webServer.on("/api/routes/image", HTTP_POST, handleRouteImageUpload);
+  webServer.on("/api/routes/image", HTTP_GET, handleRouteImageGet);
   webServer.on("/route.html", HTTP_GET, handleRouteEditor);
+  webServer.on("/songs.html", HTTP_GET, handleSongsEditor);
+  webServer.on("/api/songs", HTTP_GET, handleSongsGet);
+  webServer.on("/api/songs", HTTP_POST, handleSongsSave);
   webServer.onNotFound(handleNotFound);
 
   webServer.begin();

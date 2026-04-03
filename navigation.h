@@ -376,17 +376,25 @@ void setActiveRoute(const char* filename) {
 enum MenuLevel { MENU_CLOSED = 0, MENU_L1, MENU_L2, MENU_L3 };
 
 // Top-level menu entries
-enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_VEHICLE, ML1_COUNT };
-static const char* menuL1Names[] = {"Screen Select", "Navigation", "Vehicle"};
+enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_VEHICLE, ML1_MEDIA, ML1_RESTART, ML1_COUNT };
+static const char* menuL1Names[] = {"Screen Select", "Navigation", "Vehicle", "Media", "Restart"};
+
+// Media sub-items
+enum MenuL2Media { ML2M_PLAY_PAUSE = 0, ML2M_NEXT, ML2M_PREV, ML2M_STOP, ML2M_VOL_UP, ML2M_VOL_DOWN, ML2M_SONG_SEL, ML2M_COUNT };
+static const char* menuL2MediaNames[] = {"Play/Pause", "Next Song", "Prev Song", "Stop", "Volume +", "Volume -", "Song Select"};
+
+// Restart sub-items
+enum MenuL2Restart { ML2R_DASHBOARD = 0, ML2R_VEHICLE, ML2R_COUNT };
+static const char* menuL2RestartNames[] = {"Restart Dashboard", "Restart Vehicle"};
 
 // Screen Select sub-items
 enum MenuL2Screen { ML2S_DISPLAY1 = 0, ML2S_DISPLAY2, ML2S_COUNT };
 static const char* menuL2ScreenNames[] = {"Display 1", "Display 2"};
 
 // Navigation sub-items
-enum MenuL2Nav { ML2N_TRACK_SEL = 0, ML2N_RESTART_NAV, ML2N_STOP_NAV, ML2N_PREVIEW, ML2N_COUNT };
-static const char* menuL2NavNames[] = {"Track Select", "(Re)Start Nav", "Stop Nav", "Track Preview"};
-static const char* menuL2NavPreviewStop = "Stop Preview";
+enum MenuL2Nav { ML2N_TRACK_SEL = 0, ML2N_RESTART_NAV, ML2N_STOP_NAV, ML2N_PREVIEW, ML2N_STOP_PREVIEW, ML2N_SHOW_PATH, ML2N_COUNT };
+static const char* menuL2NavNames[] = {"Track Select", "(Re)Start Nav", "Stop Nav", "Track Preview", "Stop Preview", "Show Path"};
+static bool showRoutePath = true;  // toggle for route path overlay on D2
 
 struct Menu {
   MenuLevel level;
@@ -456,11 +464,13 @@ void menuOpen() {
   }
   menu.level = MENU_L1;
   menu.l1Idx = 0;
+  vconfEnqueueEvent(0xFE, 1);  // notify Vehicle: menu active
   Serial.println("Menu opened");
 }
 
 void menuClose() {
   menu.level = MENU_CLOSED;
+  vconfEnqueueEvent(0xFE, 0);  // notify Vehicle: menu closed
   Serial.println("Menu closed");
 }
 
@@ -472,6 +482,8 @@ static int menuItemCount() {
       if (menu.l1Parent == ML1_SCREEN_SEL) return ML2S_COUNT;
       if (menu.l1Parent == ML1_NAVIGATION) return ML2N_COUNT;
       if (menu.l1Parent == ML1_VEHICLE) return vconfRootCount();
+      if (menu.l1Parent == ML1_MEDIA) return ML2M_COUNT;
+      if (menu.l1Parent == ML1_RESTART) return ML2R_COUNT;
       return 0;
     case MENU_L3:
       if (menu.l1Parent == ML1_SCREEN_SEL) {
@@ -480,6 +492,10 @@ static int menuItemCount() {
       }
       if (menu.l1Parent == ML1_NAVIGATION && menu.l2Parent == ML2N_TRACK_SEL)
         return menu.trackCount;
+      if (menu.l1Parent == ML1_MEDIA && menu.l2Parent == ML2M_SONG_SEL) {
+        extern int songCount;
+        return songCount;
+      }
       if (menu.l1Parent == ML1_VEHICLE) {
         // L3 = children of a submenu item
         VConfItem* parent = vconfRootItem(menu.l2Parent);
@@ -550,7 +566,6 @@ void menuEnter() {
   if (menu.level == MENU_L2) {
     // Action items (no L3) — execute and close
     if (menu.l1Parent == ML1_NAVIGATION && menu.l2Idx == ML2N_RESTART_NAV) {
-      if (menu.previewMode) stopPreview();
       startNavigation();
       menuClose();
       return;
@@ -561,7 +576,62 @@ void menuEnter() {
       return;
     }
     if (menu.l1Parent == ML1_NAVIGATION && menu.l2Idx == ML2N_PREVIEW) {
-      if (menu.previewMode) stopPreview(); else startPreview();
+      startPreview();
+      menuClose();
+      return;
+    }
+    if (menu.l1Parent == ML1_NAVIGATION && menu.l2Idx == ML2N_STOP_PREVIEW) {
+      stopPreview();
+      menuClose();
+      return;
+    }
+    if (menu.l1Parent == ML1_NAVIGATION && menu.l2Idx == ML2N_SHOW_PATH) {
+      showRoutePath = !showRoutePath;
+      Serial.printf("Route path overlay: %s\n", showRoutePath ? "ON" : "OFF");
+      menuClose();
+      return;
+    }
+    // Media actions
+    if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_PLAY_PAUSE) {
+      uint16_t val = (liveData.media_state == 1) ? 1 : 0;  // 1=pause, 0=play
+      vconfEnqueueEvent(0xF9, (int16_t)val);
+      menuClose();
+      return;
+    }
+    if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_NEXT) {
+      vconfEnqueueEvent(0xF9, 2);
+      menuClose();
+      return;
+    }
+    if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_PREV) {
+      vconfEnqueueEvent(0xF9, 3);
+      menuClose();
+      return;
+    }
+    if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_STOP) {
+      vconfEnqueueEvent(0xF9, 4);
+      menuClose();
+      return;
+    }
+    if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_VOL_UP) {
+      vconfEnqueueEvent(0xF9, 6);
+      return;  // don't close menu — allow repeated presses
+    }
+    if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_VOL_DOWN) {
+      vconfEnqueueEvent(0xF9, 7);
+      return;  // don't close menu
+    }
+
+    if (menu.l1Parent == ML1_RESTART && menu.l2Idx == ML2R_DASHBOARD) {
+      menuClose();
+      Serial.println("Restarting dashboard...");
+      delay(200);
+      ESP.restart();
+      return;
+    }
+    if (menu.l1Parent == ML1_RESTART && menu.l2Idx == ML2R_VEHICLE) {
+      vconfEnqueueEvent(0xFA, 1);  // tell vehicle to restart
+      Serial.println("Restart vehicle command sent");
       menuClose();
       return;
     }
@@ -620,6 +690,14 @@ void menuEnter() {
         loadRoute(fname);
         menuClose();
       }
+    } else if (menu.l1Parent == ML1_MEDIA && menu.l2Parent == ML2M_SONG_SEL) {
+      extern int songCount;
+      if (songCount > 0 && menu.l3Idx < songCount) {
+        int16_t val = (int16_t)(5 | (menu.l3Idx << 8));
+        vconfEnqueueEvent(0xF9, val);
+        Serial.printf("Song selected: %d\n", menu.l3Idx);
+        menuClose();
+      }
     } else if (menu.l1Parent == ML1_VEHICLE) {
       // L3 = children of a submenu — interact in-place
       VConfItem* parent = vconfRootItem(menu.l2Parent);
@@ -654,12 +732,19 @@ void startNavigation() {
     Serial.println("No route loaded");
     return;
   }
+  if (menu.previewMode) stopPreview();  // stop active preview
   navRoute.currentIdx = 0;
   navRoute.finished = false;
   navRoute.projDistM = 0;
   navRoute.waitingForGPS = true;
   navRoute.startDistM = 9999;
   navRoute.startBearingDeg = 0;
+
+  // Switch D2 to navigation screen
+  extern D2Screen d2Screen;
+  extern void saveScreenState();
+  d2Screen = D2_NAVIGATION;
+  saveScreenState();
 
   // Center map on first route point
   extern float simX, simY, simHeading;
@@ -704,10 +789,16 @@ void startPreview() {
     Serial.println("Route not loaded");
     return;
   }
+  stopNavigation();  // stop active navigation
   menu.previewMode = true;
   menu.previewProgress = 0;
   navRoute.currentIdx = 0;
   navRoute.finished = false;
+  // Switch D2 to navigation screen
+  extern D2Screen d2Screen;
+  extern void saveScreenState();
+  d2Screen = D2_NAVIGATION;
+  saveScreenState();
   Serial.printf("Preview: %s (%d pts)\n", navRoute.name, navRoute.count);
 }
 
@@ -745,25 +836,8 @@ void updatePreview() {
                                        navRoute.mPerDegLat, navRoute.mPerDegLon);
   }
 
-  // Simulated walking speed
+  // Simulated walking speed (no steering simulation — servo stays centered)
   liveData.speed_kmh = 4.5f;
-
-  // Steering from lookahead: compare current heading to bearing toward
-  // a point ~2 segments ahead — like a driver looking at the road ahead
-  {
-    RoutePoint cur = {lat, lon};
-    // Lookahead: 2 points ahead (or last point)
-    int laIdx = constrain(idx + 2, 0, navRoute.count - 1);
-    float bearAhead = bearingDeg(cur, navRoute.pts[laIdx],
-                                  navRoute.mPerDegLat, navRoute.mPerDegLon);
-    float hdg = liveData.heading_deg;
-    float err = bearAhead - hdg;
-    if (err > 180) err -= 360;
-    if (err < -180) err += 360;
-    // ±45° deviation = full lock
-    float steer = constrain(err / 45.0f, -1.0f, 1.0f);
-    liveData.steer_pos = (uint8_t)(128.0f + steer * 127.0f);
-  }
 
   // Update simX/simY pixel coords so map viewport follows preview
   // Inverse of pixelToLatLon: convert lat/lon back to pixel position in tile grid
@@ -783,7 +857,10 @@ extern LGFX_Sprite sprite1;
 
 // Flags for which L2 items are actions (no L3 submenu)
 static bool menuL2IsAction(int l1, int l2) {
-  return (l1 == ML1_NAVIGATION && (l2 == ML2N_RESTART_NAV || l2 == ML2N_STOP_NAV || l2 == ML2N_PREVIEW));
+  if (l1 == ML1_NAVIGATION && (l2 == ML2N_RESTART_NAV || l2 == ML2N_STOP_NAV || l2 == ML2N_PREVIEW || l2 == ML2N_STOP_PREVIEW || l2 == ML2N_SHOW_PATH)) return true;
+  if (l1 == ML1_MEDIA && l2 != ML2M_SONG_SEL) return true;
+  if (l1 == ML1_RESTART) return true;
+  return false;
 }
 
 // Helper: draw a menu list (2x font, 240x135 landscape)
@@ -1035,15 +1112,24 @@ void renderD1Menu() {
       drawMenuList("SCREENS", menuL2ScreenNames, ML2S_COUNT,
                    menu.l2Idx, "Screen Sel");
     } else if (menu.l1Parent == ML1_NAVIGATION) {
-      // Dynamic label for preview item
+      // Dynamic label for path toggle
       const char* navNames[ML2N_COUNT];
       for (int i = 0; i < ML2N_COUNT; i++) navNames[i] = menuL2NavNames[i];
-      if (menu.previewMode) navNames[ML2N_PREVIEW] = menuL2NavPreviewStop;
+      navNames[ML2N_SHOW_PATH] = showRoutePath ? "Hide Path" : "Show Path";
       drawMenuList("NAVIGATION", navNames, ML2N_COUNT,
                    menu.l2Idx, "Nav");
     } else if (menu.l1Parent == ML1_VEHICLE) {
       drawVehicleList("VEHICLE", "Vehicle", vconfRootCount(),
                       menu.l2Idx, vconfRootItem);
+    } else if (menu.l1Parent == ML1_MEDIA) {
+      // Dynamic label: "Play" or "Pause" based on state
+      const char* mediaNames[ML2M_COUNT];
+      for (int i = 0; i < ML2M_COUNT; i++) mediaNames[i] = menuL2MediaNames[i];
+      mediaNames[ML2M_PLAY_PAUSE] = (liveData.media_state == 1) ? "Pause" : "Play";
+      drawMenuList("MEDIA", mediaNames, ML2M_COUNT, menu.l2Idx, "Media");
+    } else if (menu.l1Parent == ML1_RESTART) {
+      drawMenuList("RESTART", menuL2RestartNames, ML2R_COUNT,
+                   menu.l2Idx, "Restart");
     }
     return;
   }
@@ -1056,8 +1142,10 @@ void renderD1Menu() {
       drawMenuList("DISPLAY 2", d2ScreenNames, D2_SCREEN_COUNT,
                    menu.l3Idx, "Screens");
     } else if (menu.l1Parent == ML1_NAVIGATION && menu.l2Parent == ML2N_TRACK_SEL) {
-      // Track list with distances — custom rendering
+      // Track selection — horizontal thumbnail carousel
       sprite1.fillScreen(TFT_BLACK);
+
+      // Title bar (y 0-15)
       sprite1.fillRect(0, 0, 240, 16, 0x0841);
       sprite1.setTextSize(1);
       sprite1.setTextColor(0x4A69);
@@ -1070,10 +1158,10 @@ void renderD1Menu() {
         if ((millis() / 400) % 2) sprite1.fillCircle(230, 8, 4, TFT_RED);
       }
 
-      int totalItems = menu.trackCount + 1;
-      sprite1.setTextSize(2);
+      int totalItems = menu.trackCount + 1; // +1 for "< Back"
 
       if (menu.trackCount == 0) {
+        sprite1.setTextSize(2);
         sprite1.setTextColor(0x8410);
         sprite1.setCursor(18, 45);
         sprite1.print("No routes");
@@ -1081,42 +1169,192 @@ void renderD1Menu() {
         sprite1.setTextSize(1);
         sprite1.print("Use web UI to upload");
       } else {
+        // Thumbnail carousel area (y 18-105)
+        // Selected item centered at x=80, adjacent at x=-10 (left) and x=170 (right)
+        const int thumbW = 80, thumbH = 80;
+        const int thumbY = 18;
+        const int positions[] = { -10, 80, 170 }; // left, center, right
+        const int selIdx = menu.l3Idx;
+
+        for (int slot = 0; slot < 3; slot++) {
+          int idx = selIdx + (slot - 1); // slot0=prev, slot1=selected, slot2=next
+          if (idx < 0 || idx >= totalItems) continue;
+
+          int tx = positions[slot];
+          bool isSel = (slot == 1);
+          bool isBack = (idx == menu.trackCount);
+
+          if (isBack) {
+            // "< Back" item — no thumbnail, just text
+            sprite1.fillRect(tx, thumbY, thumbW, thumbH, 0x0841);
+            if (isSel) sprite1.drawRect(tx, thumbY, thumbW, thumbH, TFT_CYAN);
+            sprite1.setTextSize(2);
+            sprite1.setTextColor(isSel ? TFT_ORANGE : 0x6B6D);
+            int bx = tx + (thumbW - 6 * 2 * 6) / 2; // center "< Back" (6 chars * 12px)
+            sprite1.setCursor(bx, thumbY + (thumbH - 16) / 2);
+            sprite1.print("< Back");
+          } else {
+            // Try to load thumbnail from SD
+            // Build thumbnail path: strip .rte, append _thumb.png
+            char baseName[24];
+            strncpy(baseName, menu.filenames[idx], sizeof(baseName));
+            baseName[sizeof(baseName) - 1] = '\0';
+            char* dot = strrchr(baseName, '.');
+            if (dot) *dot = '\0';
+
+            char imgPath[48];
+            snprintf(imgPath, sizeof(imgPath), "/routes/%s_thumb.png", baseName);
+
+            bool drawn = false;
+            sdAcquire();
+            File f = SD.open(imgPath, FILE_READ);
+            if (f) {
+              size_t fsize = f.size();
+              if (fsize > 0 && fsize < 40000) {
+                f.read(pngBuf, fsize);
+                f.close();
+                sdRelease();
+                sprite1.drawPng(pngBuf, fsize, tx, thumbY);
+                drawn = true;
+              } else {
+                f.close();
+                sdRelease();
+              }
+            } else {
+              sdRelease();
+            }
+
+            if (!drawn) {
+              // Placeholder: dark rect with "?"
+              sprite1.fillRect(tx, thumbY, thumbW, thumbH, 0x1082);
+              sprite1.setTextSize(4);
+              sprite1.setTextColor(0x4208);
+              sprite1.setCursor(tx + (thumbW - 24) / 2, thumbY + (thumbH - 28) / 2);
+              sprite1.print("?");
+            }
+
+            // Dim adjacent (non-selected) items with a semi-transparent overlay
+            if (!isSel) {
+              for (int dy = thumbY; dy < thumbY + thumbH; dy++) {
+                for (int dx = max(0, tx); dx < min(240, tx + thumbW); dx++) {
+                  if ((dx + dy) % 2 == 0) sprite1.drawPixel(dx, dy, TFT_BLACK);
+                }
+              }
+            }
+
+            // Cyan border on selected
+            if (isSel) {
+              sprite1.drawRect(tx, thumbY, thumbW, thumbH, TFT_CYAN);
+            }
+          }
+        }
+
+        // Track name + distance below thumbnail (y 107-120)
+        sprite1.setTextSize(1);
+        if (selIdx < menu.trackCount) {
+          // Name centered in white
+          int nameW = strlen(menu.names[selIdx]) * 6;
+          sprite1.setTextColor(TFT_WHITE);
+          sprite1.setCursor((240 - nameW) / 2, 107);
+          sprite1.print(menu.names[selIdx]);
+
+          // Distance in grey
+          char distBuf[12];
+          int dist = menu.distances[selIdx];
+          if (dist < 1000) snprintf(distBuf, sizeof(distBuf), "%dm", dist);
+          else snprintf(distBuf, sizeof(distBuf), "%.1fkm", dist / 1000.0f);
+          int distW = strlen(distBuf) * 6;
+          sprite1.setTextColor(0x8410);
+          sprite1.setCursor((240 - distW) / 2, 118);
+          sprite1.print(distBuf);
+        } else {
+          // "< Back" selected — show hint
+          sprite1.setTextColor(TFT_ORANGE);
+          int bkW = 11 * 6; // "< Go back >"
+          sprite1.setCursor((240 - bkW) / 2, 112);
+          sprite1.print("< Go back >");
+        }
+      }
+
+      // Bottom bar (y 122-134)
+      sprite1.fillRect(0, 122, 240, 13, 0x0841);
+      sprite1.setTextColor(0x4A69);
+      sprite1.setTextSize(1);
+      sprite1.setCursor(16, 125);
+      sprite1.print("L/R:browse  OK:select  BACK:up");
+      sprite1.pushSprite(0, 0);
+    } else if (menu.l1Parent == ML1_MEDIA && menu.l2Parent == ML2M_SONG_SEL) {
+      extern char songTitles[][33];
+      extern char songArtists[][21];
+      extern int songCount;
+
+      sprite1.fillScreen(TFT_BLACK);
+
+      // Title bar
+      sprite1.fillRect(0, 0, 240, 16, 0x0841);
+      sprite1.setTextSize(1);
+      sprite1.setTextColor(0x4A69);
+      sprite1.setCursor(4, 4);
+      sprite1.print("Media > ");
+      sprite1.setTextColor(TFT_CYAN);
+      sprite1.print("SONGS");
+
+      int totalItems = songCount + 1;  // +1 for Back
+
+      if (songCount == 0) {
+        sprite1.setTextSize(2);
+        sprite1.setTextColor(0x8410);
+        sprite1.setCursor(18, 45);
+        sprite1.print("No songs");
+        sprite1.setCursor(18, 68);
+        sprite1.setTextSize(1);
+        sprite1.print("Add songs.txt to SD");
+      } else {
+        // Scrollable list with 4 visible items
         int maxVis = 4;
         int visCount = min(maxVis, totalItems);
         int startIdx = menu.l3Idx - visCount / 2;
         if (startIdx < 0) startIdx = 0;
         if (startIdx + visCount > totalItems) startIdx = totalItems - visCount;
 
+        sprite1.setTextSize(1);
         for (int i = 0; i < visCount; i++) {
           int idx = startIdx + i;
-          int y = 18 + i * 24;
+          int y = 18 + i * 26;
           bool selected = (idx == menu.l3Idx);
+
           if (selected) {
-            sprite1.fillRect(2, y, 236, 22, 0x0841);
-            sprite1.drawRect(2, y, 236, 22, TFT_CYAN);
-            sprite1.setTextColor(TFT_WHITE);
-          } else {
-            sprite1.setTextColor(0x8410);
+            sprite1.fillRect(2, y, 236, 24, 0x0841);
+            sprite1.drawRect(2, y, 236, 24, TFT_CYAN);
           }
-          sprite1.setTextSize(2);
-          sprite1.setCursor(8, y + 3);
-          if (idx < menu.trackCount) {
-            sprite1.print(menu.names[idx]);
-            // Distance in small font on right
-            int dist = menu.distances[idx];
-            sprite1.setTextSize(1);
-            sprite1.setTextColor(selected ? 0x6B6D : 0x4208);
-            sprite1.setCursor(190, y + 7);
-            if (dist < 1000) sprite1.printf("%dm", dist);
-            else sprite1.printf("%.1fkm", dist / 1000.0f);
+
+          sprite1.setCursor(8, y + 2);
+          if (idx < songCount) {
+            // Song title
+            sprite1.setTextColor(selected ? TFT_WHITE : 0x8410);
+            char titleBuf[28];
+            strncpy(titleBuf, songTitles[idx], 27); titleBuf[27] = '\0';
+            sprite1.print(titleBuf);
+            // Artist below title
+            sprite1.setTextColor(selected ? TFT_CYAN : 0x6B6D);
+            sprite1.setCursor(8, y + 13);
+            sprite1.print(songArtists[idx]);
+            // Current song indicator
+            if (idx == liveData.media_song) {
+              sprite1.setTextColor(TFT_GREEN);
+              sprite1.setCursor(228, y + 6);
+              sprite1.print("*");
+            }
           } else {
             sprite1.setTextColor(selected ? TFT_ORANGE : 0x6B6D);
+            sprite1.setTextSize(2);
+            sprite1.setCursor(8, y + 4);
             sprite1.print("< Back");
+            sprite1.setTextSize(1);
           }
         }
 
         // Scroll indicators
-        sprite1.setTextSize(1);
         if (startIdx > 0) {
           sprite1.setTextColor(0x4A69);
           sprite1.setCursor(116, 17);
@@ -1129,10 +1367,11 @@ void renderD1Menu() {
         }
       }
 
+      // Bottom bar
       sprite1.fillRect(0, 122, 240, 13, 0x0841);
       sprite1.setTextColor(0x4A69);
       sprite1.setTextSize(1);
-      sprite1.setCursor(20, 125);
+      sprite1.setCursor(16, 125);
       sprite1.print("UP/DN:browse  OK:select  BACK:up");
       sprite1.pushSprite(0, 0);
     } else if (menu.l1Parent == ML1_VEHICLE) {

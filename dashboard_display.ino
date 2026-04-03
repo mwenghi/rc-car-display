@@ -9,7 +9,7 @@
  * Boot: hold BOOT button → web config mode (WiFi + web UI)
  * Normal boot → navigation mode (auto-downloads if needed)
  *
- * Waveshare: DIN=13, CLK=27, CS=15, DC=17, RST=22, BL=25
+ * Waveshare: DIN=13, CLK=27, CS=15, DC=17, RST=22, BL=2
  * SD Card:   MOSI=13, SCK=27, MISO=21, CS=33
  */
 
@@ -99,7 +99,7 @@ public:
       cfg.rgb_order = false; cfg.dlen_16bit = false; cfg.bus_shared = true;
       _panel.config(cfg); }
     { auto cfg = _light.config();
-      cfg.pin_bl = 25; cfg.invert = false; cfg.freq = 12000; cfg.pwm_channel = 1;
+      cfg.pin_bl = 2; cfg.invert = false; cfg.freq = 12000; cfg.pwm_channel = 1;
       _light.config(cfg); _panel.setLight(&_light); }
     setPanel(&_panel);
   }
@@ -125,6 +125,7 @@ enum D1Screen {
   D1_MEDIA,           // placeholder
   D1_IMU,             // IMU tilt visualization
   D1_ABOUT,           // about/credits
+  D1_GOGGLES,         // head tracker 3D cuboid + compass
   D1_SCREEN_COUNT
 };
 
@@ -142,11 +143,20 @@ enum D2Screen {
 D1Screen d1Screen = D1_DASHBOARD;
 D2Screen d2Screen = D2_NAVIGATION;
 
+// Song data loaded from SD card
+#define MAX_SONGS 20
+#define SONG_TITLE_LEN 33
+#define SONG_ARTIST_LEN 21
+
+char songTitles[MAX_SONGS][SONG_TITLE_LEN] = {};
+char songArtists[MAX_SONGS][SONG_ARTIST_LEN] = {};
+int songCount = 0;
+
 // Previous screen tracking (to clear on switch)
 D1Screen d1PrevScreen = D1_DASHBOARD;
 D2Screen d2PrevScreen = D2_NAVIGATION;
 
-const char* d1ScreenNames[] = {"Dashboard", "Navigation", "Media", "IMU", "About"};
+const char* d1ScreenNames[] = {"Dashboard", "Navigation", "Media", "IMU", "About", "Goggles"};
 const char* d2ScreenNames[] = {"Navigation", "Map", "Battery", "Signal", "Media", "Debug"};
 
 // Forward declarations for sdAcquire/sdRelease (defined in web_server.h)
@@ -180,6 +190,31 @@ void loadScreenState() {
     }
   }
   sdRelease();
+}
+
+void loadSongList() {
+  songCount = 0;
+  sdAcquire();
+  File f = SD.open("/music/songs.txt", FILE_READ);
+  if (!f) { sdRelease(); Serial.println("[Media] No songs.txt"); return; }
+  while (f.available() && songCount < MAX_SONGS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || line[0] == '#') continue;
+    int p1 = line.indexOf('|');
+    String title = (p1 >= 0) ? line.substring(0, p1) : line;
+    String artist = (p1 >= 0) ? line.substring(p1 + 1) : "";
+    // Artist might have another | for album — just take first part
+    int p2 = artist.indexOf('|');
+    if (p2 >= 0) artist = artist.substring(0, p2);
+    title.trim(); artist.trim();
+    strncpy(songTitles[songCount], title.c_str(), SONG_TITLE_LEN - 1);
+    strncpy(songArtists[songCount], artist.c_str(), SONG_ARTIST_LEN - 1);
+    songCount++;
+  }
+  f.close();
+  sdRelease();
+  Serial.printf("[Media] Loaded %d songs\n", songCount);
 }
 
 // Button: short press = cycle D1, long press = cycle D2
@@ -216,6 +251,7 @@ void checkScreenButton() {
 #include "i2c_slave.h"
 #include "navigation.h"
 #include "web_server.h"
+#include "rtc_sd2405.h"
 
 // ─── Steering wheel servo (continuous rotation) ──────────────────────────────
 // CR servo: 1500µs = stop, <1500 = CW, >1500 = CCW
@@ -226,25 +262,74 @@ void checkScreenButton() {
 
 static float servoAngle = 0.0f;  // estimated current angle (degrees)
 
+#include "driver/mcpwm_prelude.h"
+static mcpwm_cmpr_handle_t _servoCmp = NULL;
+static bool _servoOk = false;
+
 void servoSetup() {
-  ledcAttach(SERVO_PIN, 50, 16);
-  ledcWrite(SERVO_PIN, 1500u * 65535u / 20000u);  // start stopped
+  mcpwm_timer_handle_t timer = NULL;
+  mcpwm_timer_config_t tcfg = {};
+  tcfg.group_id = 0;
+  tcfg.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT;
+  tcfg.resolution_hz = 1000000;  // 1µs per tick
+  tcfg.count_mode = MCPWM_TIMER_COUNT_MODE_UP;
+  tcfg.period_ticks = 20000;     // 20ms = 50Hz
+  if (mcpwm_new_timer(&tcfg, &timer) != ESP_OK) {
+    Serial.println("[Servo] timer FAILED"); return;
+  }
+
+  mcpwm_oper_handle_t oper = NULL;
+  mcpwm_operator_config_t ocfg = {};
+  ocfg.group_id = 0;
+  mcpwm_new_operator(&ocfg, &oper);
+  mcpwm_operator_connect_timer(oper, timer);
+
+  mcpwm_comparator_config_t ccfg = {};
+  ccfg.flags.update_cmp_on_tez = true;
+  mcpwm_new_comparator(oper, &ccfg, &_servoCmp);
+
+  mcpwm_gen_handle_t gen = NULL;
+  mcpwm_generator_config_t gcfg = {};
+  gcfg.gen_gpio_num = SERVO_PIN;
+  mcpwm_new_generator(oper, &gcfg, &gen);
+
+  // PWM: HIGH on timer empty (period start), LOW on compare match
+  mcpwm_generator_set_action_on_timer_event(gen,
+    MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH));
+  mcpwm_generator_set_action_on_compare_event(gen,
+    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, _servoCmp, MCPWM_GEN_ACTION_LOW));
+
+  mcpwm_comparator_set_compare_value(_servoCmp, 1500);  // 1500µs = stop
+  mcpwm_timer_enable(timer);
+  mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP);
+
+  _servoOk = true;
+  Serial.printf("[Servo] MCPWM pin %d: OK\n", SERVO_PIN);
 }
 
 void servoUpdate() {
+  if (!_servoOk) return;
+
+  // Disable servo in simulation / track preview / menu mode
+  if (!liveData.masterPresent || menu.previewMode || menuIsActive()) {
+    mcpwm_comparator_set_compare_value(_servoCmp, 1500);  // stop
+    servoAngle = 0;
+    return;
+  }
+
   static unsigned long prevMs = 0;
   unsigned long now = millis();
   float dt = constrain((now - prevMs) * 0.001f, 0.0f, 0.1f);
   prevMs = now;
 
-  float target = (liveData.steer_pos - 128.0f) / 128.0f * 180.0f;
+  // Inverted: negate target direction
+  float target = -((liveData.steer_pos - 128.0f) / 128.0f * 180.0f);
   float err = target - servoAngle;
 
   int us;
-  if (fabsf(err) < 2.0f) {
+  if (fabsf(err) < 5.0f) {
     us = 1500;                                           // dead zone — stop
-    // Re-anchor: when stopped near center, reset estimate to kill drift
-    if (fabsf(target) < 5.0f) servoAngle = 0;
+    servoAngle = target;                                 // snap to prevent drift
   } else {
     bool returning = fabsf(target) < fabsf(servoAngle);  // moving toward center?
     int dev;
@@ -257,7 +342,7 @@ void servoUpdate() {
     servoAngle += (dev / 500.0f) * SERVO_SPEED_DPS * dt;
     servoAngle = constrain(servoAngle, -180.0f, 180.0f);
   }
-  ledcWrite(SERVO_PIN, (uint32_t)us * 65535u / 20000u);
+  mcpwm_comparator_set_compare_value(_servoCmp, us);
 }
 
 // Simulation
@@ -540,7 +625,30 @@ void scanTileGrid() {
   saveTileGridCache();
 }
 
+// ─── Menu input polling (called from loop and between tile draws) ───────────
+
+void pollMenuInput() {
+  if (!menuIsActive() || !liveData.masterPresent) return;
+  static unsigned long lastSteerAction = 0;
+  static bool throttleWasHigh = false;
+  // Steer left (< 76) / right (> 178) to browse (~40% deflection)
+  // Left = next, Right = prev (reversed)
+  if (millis() - lastSteerAction > 400) {
+    if (liveData.steer_pos < 76) { menuNext(); lastSteerAction = millis(); }
+    else if (liveData.steer_pos > 178) { menuPrev(); lastSteerAction = millis(); }
+  }
+  // Throttle forward ~26% (raw ~160 → throttle_pct ~26) then back to ~0 to confirm
+  if (liveData.throttle_pct > 25) throttleWasHigh = true;
+  if (throttleWasHigh && liveData.throttle_pct < 5) {
+    throttleWasHigh = false;
+    menuEnter();
+  }
+}
+
 // ─── Tile drawing helper ─────────────────────────────────────────────────────
+
+// Current viewport clip size (set before tile rendering loops)
+static int _tileClipW = 172, _tileClipH = 320;
 
 void drawTile(int gx, int gy, int vpX, int vpY) {
   char path[40];
@@ -558,8 +666,113 @@ void drawTile(int gx, int gy, int vpX, int vpY) {
   f.close();
   digitalWrite(SD_CS, HIGH);
 
+  int tilePixX = gx * TPX - vpX;
+  int tilePixY = gy * TPX - vpY;
   disp2.startWrite();
-  disp2.drawPng(pngBuf, len, gx * TPX - vpX, gy * TPX - vpY);
+  disp2.drawPng(pngBuf, len, tilePixX, tilePixY);
+  disp2.endWrite();
+
+  // Draw route segments on this tile immediately (no flicker)
+  drawRouteOnTile(vpX, vpY, tilePixX, tilePixY, _tileClipW, _tileClipH);
+}
+
+// ─── Route path overlay on D2 map ───────────────────────────────────────────
+
+// Convert lat/lon (×1e7 int32) to pixel position in tile grid
+static inline void geoToPixel(int32_t lat7, int32_t lon7, float& px, float& py) {
+  int n = 1 << TILE_ZOOM;
+  float lon = lon7 / 1e7f;
+  float lat = lat7 / 1e7f;
+  float tileX = (lon + 180.0f) / 360.0f * n;
+  float latRad = lat * PI / 180.0f;
+  float tileY = (1.0f - logf(tanf(latRad) + 1.0f / cosf(latRad)) / PI) / 2.0f * n;
+  px = (tileX - GRID_X0) * TPX;
+  py = (tileY - GRID_Y0) * TPX;
+}
+
+// Draw route path segments that fall within a tile area, right after tile is drawn
+// tilePixX/Y = top-left corner of this tile in viewport coords
+// clipW/H = viewport dimensions for clipping
+void drawRouteOnTile(int vpX, int vpY, int tilePixX, int tilePixY, int clipW, int clipH) {
+  if (!showRoutePath || !navRoute.active || navRoute.count < 2) return;
+
+  // Tile area in absolute pixel coords
+  int absX0 = vpX + tilePixX, absY0 = vpY + tilePixY;
+  int absX1 = absX0 + TPX, absY1 = absY0 + TPX;
+
+  disp2.startWrite();
+  disp2.setClipRect(max(0, tilePixX), max(0, tilePixY),
+                    min(TPX, clipW - max(0, tilePixX)),
+                    min(TPX, clipH - max(0, tilePixY)));
+
+  int step = max(1, (int)(navRoute.count / 500));
+  float prevPx, prevPy;
+  geoToPixel(navRoute.pts[0].lat, navRoute.pts[0].lon, prevPx, prevPy);
+
+  for (int i = step; i < navRoute.count; i += step) {
+    float cx, cy;
+    geoToPixel(navRoute.pts[i].lat, navRoute.pts[i].lon, cx, cy);
+    // Check if segment might cross this tile
+    float segMinX = min(prevPx, cx), segMaxX = max(prevPx, cx);
+    float segMinY = min(prevPy, cy), segMaxY = max(prevPy, cy);
+    if (segMaxX >= absX0 - 5 && segMinX <= absX1 + 5 &&
+        segMaxY >= absY0 - 5 && segMinY <= absY1 + 5) {
+      int x0 = (int)prevPx - vpX, y0 = (int)prevPy - vpY;
+      int x1 = (int)cx - vpX,     y1 = (int)cy - vpY;
+      disp2.drawLine(x0, y0, x1, y1, TFT_MAGENTA);
+      disp2.drawLine(x0+1, y0, x1+1, y1, TFT_MAGENTA);
+      disp2.drawLine(x0, y0+1, x1, y1+1, TFT_MAGENTA);
+    }
+    prevPx = cx; prevPy = cy;
+  }
+  // Last segment
+  float lx, ly;
+  geoToPixel(navRoute.pts[navRoute.count-1].lat, navRoute.pts[navRoute.count-1].lon, lx, ly);
+  if (lx != prevPx || ly != prevPy) {
+    float segMinX = min(prevPx, lx), segMaxX = max(prevPx, lx);
+    float segMinY = min(prevPy, ly), segMaxY = max(prevPy, ly);
+    if (segMaxX >= absX0 - 5 && segMinX <= absX1 + 5 &&
+        segMaxY >= absY0 - 5 && segMinY <= absY1 + 5) {
+      disp2.drawLine((int)prevPx-vpX, (int)prevPy-vpY, (int)lx-vpX, (int)ly-vpY, TFT_MAGENTA);
+    }
+  }
+
+  disp2.clearClipRect();
+  disp2.endWrite();
+}
+
+// Draw entire route path clipped to viewport — called after each tile
+void drawRouteFullClipped(int vpX, int vpY, int clipW, int clipH) {
+  if (!showRoutePath || !navRoute.active || navRoute.count < 2) return;
+
+  disp2.startWrite();
+  disp2.setClipRect(0, 0, clipW, clipH);
+
+  int step = max(1, (int)(navRoute.count / 500));
+  float prevPx, prevPy;
+  geoToPixel(navRoute.pts[0].lat, navRoute.pts[0].lon, prevPx, prevPy);
+
+  for (int i = step; i < navRoute.count; i += step) {
+    float cx, cy;
+    geoToPixel(navRoute.pts[i].lat, navRoute.pts[i].lon, cx, cy);
+    int x0 = (int)prevPx - vpX, y0 = (int)prevPy - vpY;
+    int x1 = (int)cx - vpX,     y1 = (int)cy - vpY;
+    if ((x0 >= -20 && x0 < clipW + 20 && y0 >= -20 && y0 < clipH + 20) ||
+        (x1 >= -20 && x1 < clipW + 20 && y1 >= -20 && y1 < clipH + 20)) {
+      disp2.drawLine(x0, y0, x1, y1, TFT_MAGENTA);
+      disp2.drawLine(x0+1, y0, x1+1, y1, TFT_MAGENTA);
+      disp2.drawLine(x0, y0+1, x1, y1+1, TFT_MAGENTA);
+    }
+    prevPx = cx; prevPy = cy;
+  }
+  // Last point
+  if (navRoute.count % step != 1) {
+    float lx, ly;
+    geoToPixel(navRoute.pts[navRoute.count-1].lat, navRoute.pts[navRoute.count-1].lon, lx, ly);
+    disp2.drawLine((int)prevPx-vpX, (int)prevPy-vpY, (int)lx-vpX, (int)ly-vpY, TFT_MAGENTA);
+  }
+
+  disp2.clearClipRect();
   disp2.endWrite();
 }
 
@@ -571,6 +784,7 @@ void renderMap() {
   int vpY = (int)simY - 160;  // 320/2
   vpX = constrain(vpX, 0, MAP_PX_W - 172);
   vpY = constrain(vpY, 0, MAP_PX_H - 320);
+  _tileClipW = 172; _tileClipH = 320;
 
   // Visible tile range
   int tx0 = vpX / TPX, tx1 = (vpX + 171) / TPX;
@@ -586,6 +800,7 @@ void renderMap() {
       if (tx == markerGx && ty == markerGy) continue;
       if (tx < 0 || tx >= GRID_W || ty < 0 || ty >= GRID_H) continue;
       drawTile(tx, ty, vpX, vpY);
+      pollMenuInput();
     }
   }
 
@@ -663,11 +878,14 @@ void renderD2Navigation() {
       f.read(pngBuf, fsize);
       f.close();
       digitalWrite(SD_CS, HIGH);
+      int tpx = tx * TPX - vpX, tpy = ty * TPX - vpY;
       disp2.startWrite();
       disp2.setClipRect(0, 0, 172, 160);
-      disp2.drawPng(pngBuf, fsize, tx * TPX - vpX, ty * TPX - vpY);
+      disp2.drawPng(pngBuf, fsize, tpx, tpy);
       disp2.clearClipRect();
       disp2.endWrite();
+      drawRouteOnTile(vpX, vpY, tpx, tpy, 172, 160);
+      pollMenuInput();
     }
   }
 
@@ -836,7 +1054,7 @@ void renderNavInfo() {
   // ═══════════════════════════════════════════════════════════════════════════
   // SPEEDOMETER GAUGE (left half) — semicircular arc, 0-200 km/h
   // ═══════════════════════════════════════════════════════════════════════════
-  int gx = 68, gy = 72, gr = 56;
+  int gx = 68, gy = 62, gr = 56;
   float startAng = -225.0f;
   float endAng = 45.0f;
   float sweepDeg = endAng - startAng;  // 270°
@@ -924,41 +1142,55 @@ void renderNavInfo() {
   // ═══════════════════════════════════════════════════════════════════════════
   int rx = 140;  // right panel x start
 
-  // THROTTLE
-  sprite1.setTextColor(0xC618);
-  sprite1.setTextSize(1);
-  sprite1.setCursor(rx, 4);
-  sprite1.print("THROTTLE");
-  sprite1.setCursor(rx + 60, 4);
-  sprite1.printf("%3d%%", (int)liveData.throttle_pct);
+  // THROTTLE / BRAKE
+  int barW = 95;
+  {
+    bool braking = liveData.throttle_pct < 0;
+    int pct = (int)fabsf(liveData.throttle_pct);
+    sprite1.setTextColor(0xC618);
+    sprite1.setTextSize(1);
+    sprite1.setCursor(rx, 4);
+    sprite1.print(braking ? "BRAKE" : "THROTTLE");
+    sprite1.setCursor(rx + 60, 4);
+    sprite1.printf("%3d%%", pct);
 
-  int barX = rx, barY = 16, barW = 95, barH = 16;
-  sprite1.drawRect(barX, barY, barW, barH, 0x4208);
-  int fillW = (int)(liveData.throttle_pct / 100.0f * (barW - 2));
-  for (int x = 0; x < fillW; x++) {
-    float f = (float)x / (barW - 2);
-    uint8_t r, g;
-    if (f < 0.5f) { g = 220; r = (uint8_t)(f * 2 * 220); }
-    else { r = 220; g = (uint8_t)((1.0f - f) * 2 * 220); }
-    sprite1.drawFastVLine(barX + 1 + x, barY + 1, barH - 2, sprite1.color565(r, g, 0));
+    int barX = rx, barY = 16, barH = 16;
+    sprite1.drawRect(barX, barY, barW, barH, 0x4208);
+    int fillW = (int)(pct / 100.0f * (barW - 2));
+    for (int x = 0; x < fillW; x++) {
+      float f = (float)x / (barW - 2);
+      uint8_t r, g;
+      if (braking) { r = 220; g = (uint8_t)((1.0f - f) * 80); }
+      else if (f < 0.5f) { g = 220; r = (uint8_t)(f * 2 * 220); }
+      else { r = 220; g = (uint8_t)((1.0f - f) * 2 * 220); }
+      sprite1.drawFastVLine(barX + 1 + x, barY + 1, barH - 2, sprite1.color565(r, g, 0));
+    }
   }
 
-  // RPM
+  // STEERING
   sprite1.setTextColor(0xC618);
   sprite1.setCursor(rx, 38);
-  sprite1.print("RPM");
-  float rpmFrac = liveData.throttle_pct / 100.0f * 0.7f + liveData.speed_kmh / 200.0f * 0.3f;
-  sprite1.setCursor(rx + 30, 38);
-  sprite1.printf("%4d", (int)(rpmFrac * 8000));
+  sprite1.print("STEER");
+  int steerPct = (int)((liveData.steer_pos - 128) * 100 / 127);  // -100..+100
+  sprite1.setCursor(rx + 42, 38);
+  sprite1.printf("%+4d", steerPct);
 
-  int rpmBarY = 50;
-  sprite1.drawRect(rx, rpmBarY, barW, 12, 0x2104);
-  int rpmFill = (int)(rpmFrac * (barW - 2));
-  for (int x = 0; x < rpmFill; x++) {
-    float f = (float)x / (barW - 2);
-    uint16_t col = f < 0.7f ? sprite1.color565(0, 140, 0) :
-                   f < 0.85f ? TFT_YELLOW : TFT_RED;
-    sprite1.drawFastVLine(rx + 1 + x, rpmBarY + 1, 10, col);
+  int steerBarY = 50;
+  int steerBarH = 12;
+  sprite1.drawRect(rx, steerBarY, barW, steerBarH, 0x2104);
+  int center = barW / 2;
+  sprite1.drawFastVLine(rx + center, steerBarY + 1, steerBarH - 2, 0x4208);
+  float steerFrac = (liveData.steer_pos - 128) / 127.0f;  // -1..+1
+  steerFrac = constrain(steerFrac, -1.0f, 1.0f);
+  int steerFill = (int)(fabsf(steerFrac) * (center - 1));
+  uint16_t steerCol = fabsf(steerFrac) < 0.3f ? sprite1.color565(0, 140, 0) :
+                      fabsf(steerFrac) < 0.7f ? TFT_YELLOW : TFT_ORANGE;
+  if (steerFrac < 0) {
+    for (int x = 0; x < steerFill; x++)
+      sprite1.drawFastVLine(rx + center - 1 - x, steerBarY + 1, steerBarH - 2, steerCol);
+  } else {
+    for (int x = 0; x < steerFill; x++)
+      sprite1.drawFastVLine(rx + center + 1 + x, steerBarY + 1, steerBarH - 2, steerCol);
   }
 
   // Separator line
@@ -1049,6 +1281,18 @@ void renderNavInfo() {
   sprite1.setCursor(rx, iy2 + 14);
   sprite1.printf("HDG %.0f%c", liveData.heading_deg, (char)247);
 
+  // ── Bottom: time (large, left) + date (small, right) ──
+  if (rtcTime.valid) {
+    sprite1.setTextColor(TFT_WHITE);
+    sprite1.setTextSize(2);
+    sprite1.setCursor(19, 119);
+    sprite1.printf("%02d:%02d:%02d", rtcTime.hour, rtcTime.minute, rtcTime.second);
+    sprite1.setTextSize(1);
+    sprite1.setTextColor(0x6B6D);
+    sprite1.setCursor(rx, 127);
+    sprite1.printf("%02d.%02d.%04d", rtcTime.day, rtcTime.month, rtcTime.year);
+  }
+
   sprite1.pushSprite(0, 0);
 }
 
@@ -1079,20 +1323,26 @@ void renderD1Navigation() {
   sprite1.setCursor(4, 22);
   sprite1.print("km/h");
 
-  // Vertical throttle bar (rotated -90: bottom=0%, top=100%)
-  int tbX = 6, tbY = 34, tbW = 14, tbH = 96;
-  sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
-  int fillH = (int)(liveData.throttle_pct / 100.0f * (tbH - 2));
-  for (int y = 0; y < fillH; y++) {
-    float f = (float)y / (tbH - 2);
-    uint8_t r = (f < 0.5f) ? (uint8_t)(f * 2 * 200) : 200;
-    uint8_t g = (f < 0.5f) ? 200 : (uint8_t)((1.0f - f) * 2 * 200);
-    sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+  // Vertical throttle/brake bar (bottom=0%, top=100%)
+  {
+    bool braking = liveData.throttle_pct < 0;
+    int pct = (int)fabsf(liveData.throttle_pct);
+    int tbX = 6, tbY = 34, tbW = 14, tbH = 88;
+    sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
+    int fillH = (int)(pct / 100.0f * (tbH - 2));
+    for (int y = 0; y < fillH; y++) {
+      float f = (float)y / (tbH - 2);
+      uint8_t r, g;
+      if (braking) { r = 200; g = (uint8_t)((1.0f - f) * 60); }
+      else if (f < 0.5f) { r = (uint8_t)(f * 2 * 200); g = 200; }
+      else { r = 200; g = (uint8_t)((1.0f - f) * 2 * 200); }
+      sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+    }
+    sprite1.setTextColor(0x6B6D);
+    sprite1.setCursor(0, 126);
+    if (rtcTime.valid) sprite1.printf("%02d:%02d", rtcTime.hour, rtcTime.minute);
+    else sprite1.printf("%d%%", pct);
   }
-  // Throttle percentage below bar
-  sprite1.setTextColor(0x6B6D);
-  sprite1.setCursor(2, tbY + tbH + 2);
-  sprite1.printf("%d%%", (int)liveData.throttle_pct);
 
   // ── Center: Navigation arrow (30..104) with padding ──
   int ax = 68, ay = 56;
@@ -1220,12 +1470,7 @@ void renderD1Navigation() {
 
 // ─── D1 Media screen (240x135 landscape) ─────────────────────────────────────
 
-// Reuse song data from D2 media
-extern const char* songNames[];
-extern const char* artistNames[];
-extern const int songCount;
-extern int mediaSongIdx;
-extern bool mediaPlaying;
+// Reuse media data
 extern float freqBands[];
 extern float freqTargets[];
 
@@ -1245,26 +1490,34 @@ void renderD1Media() {
   sprite1.setCursor(4, 22);
   sprite1.print("km/h");
 
-  // Vertical throttle bar
-  int tbX = 6, tbY = 34, tbW = 14, tbH = 96;
-  sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
-  int fillH = (int)(liveData.throttle_pct / 100.0f * (tbH - 2));
-  for (int y = 0; y < fillH; y++) {
-    float f = (float)y / (tbH - 2);
-    uint8_t r = (f < 0.5f) ? (uint8_t)(f * 2 * 200) : 200;
-    uint8_t g = (f < 0.5f) ? 200 : (uint8_t)((1.0f - f) * 2 * 200);
-    sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+  // Vertical throttle/brake bar
+  {
+    bool braking = liveData.throttle_pct < 0;
+    int pct = (int)fabsf(liveData.throttle_pct);
+    int tbX = 6, tbY = 34, tbW = 14, tbH = 88;
+    sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
+    int fillH = (int)(pct / 100.0f * (tbH - 2));
+    for (int y = 0; y < fillH; y++) {
+      float f = (float)y / (tbH - 2);
+      uint8_t r, g;
+      if (braking) { r = 200; g = (uint8_t)((1.0f - f) * 60); }
+      else if (f < 0.5f) { r = (uint8_t)(f * 2 * 200); g = 200; }
+      else { r = 200; g = (uint8_t)((1.0f - f) * 2 * 200); }
+      sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+    }
+    sprite1.setTextColor(0x6B6D);
+    sprite1.setCursor(0, 126);
+    if (rtcTime.valid) sprite1.printf("%02d:%02d", rtcTime.hour, rtcTime.minute);
+    else sprite1.printf("%d%%", pct);
   }
-  sprite1.setTextColor(0x6B6D);
-  sprite1.setCursor(2, tbY + tbH + 2);
-  sprite1.printf("%d%%", (int)liveData.throttle_pct);
 
   // ── Album art (small) ──
   int artX = 30, artY = 4, artS = 44;
+  uint8_t songIdx = liveData.media_song;
   uint16_t artCol = sprite1.color565(
-    40 + (mediaSongIdx * 23) % 80,
-    30 + (mediaSongIdx * 37) % 60,
-    50 + (mediaSongIdx * 41) % 90
+    40 + (songIdx * 23) % 80,
+    30 + (songIdx * 37) % 60,
+    50 + (songIdx * 41) % 90
   );
   sprite1.fillRoundRect(artX, artY, artS, artS, 5, artCol);
   sprite1.fillCircle(artX + 14, artY + 30, 5, TFT_WHITE);
@@ -1278,27 +1531,29 @@ void renderD1Media() {
   sprite1.setTextColor(TFT_WHITE);
   sprite1.setTextSize(1);
   char songBuf[22];
-  strncpy(songBuf, songNames[mediaSongIdx], 21); songBuf[21] = '\0';
+  strncpy(songBuf, currentSongTitle(), 21); songBuf[21] = '\0';
   sprite1.setCursor(tx, 6);
   sprite1.print(songBuf);
 
   sprite1.setTextColor(0x8410);
   sprite1.setCursor(tx, 18);
-  sprite1.print(artistNames[mediaSongIdx]);
+  sprite1.print(currentSongArtist());
 
-  // Play/pause icon + progress bar
+  // Play/pause/stop icon + progress bar
   int pcx = tx, pcy = 34;
-  if (mediaPlaying) {
+  if (liveData.media_state == 1) {  // playing → show pause icon
     sprite1.fillRect(pcx, pcy, 4, 10, TFT_WHITE);
     sprite1.fillRect(pcx + 6, pcy, 4, 10, TFT_WHITE);
-  } else {
+  } else if (liveData.media_state == 0) {  // stopped → show stop icon
+    sprite1.fillRect(pcx, pcy, 10, 10, 0x8410);
+  } else {  // paused → show play icon
     sprite1.fillTriangle(pcx, pcy, pcx, pcy + 10, pcx + 9, pcy + 5, TFT_WHITE);
   }
 
-  float progress = fmodf(millis() * 0.00003f, 1.0f);
+  float progress = (liveData.media_state == 1) ? fmodf(millis() * 0.00003f, 1.0f) : 0.0f;
   int pbX = pcx + 16, pbW = 232 - pbX;
   sprite1.drawRoundRect(pbX, pcy + 2, pbW, 5, 2, 0x4208);
-  sprite1.fillRoundRect(pbX + 1, pcy + 3, (int)(progress * (pbW - 2)), 3, 1, TFT_CYAN);
+  if (progress > 0) sprite1.fillRoundRect(pbX + 1, pcy + 3, (int)(progress * (pbW - 2)), 3, 1, TFT_CYAN);
 
   int totalSec = 240;
   int curSec = (int)(progress * totalSec);
@@ -1306,8 +1561,8 @@ void renderD1Media() {
   sprite1.setCursor(pcx + 16, pcy + 10);
   sprite1.printf("%d:%02d / %d:%02d", curSec / 60, curSec % 60, totalSec / 60, totalSec % 60);
 
-  // ── Frequency visualizer (bottom, y=54..132) ──
-  int vizX = 28, vizY = 56, vizH = 76, vizW = 208;
+  // ── Frequency visualizer (bottom, y=56..120) ──
+  int vizX = 28, vizY = 56, vizH = 64, vizW = 208;
   int bandCount = 32;
   int bandW = vizW / bandCount;
 
@@ -1326,6 +1581,18 @@ void renderD1Media() {
       uint8_t b = (uint8_t)(255 - f * 200);
       sprite1.drawFastHLine(bx, by + (bh - 1 - y), bandW - 1, sprite1.color565(r, g, b));
     }
+  }
+
+  // Volume bar (bottom-right)
+  {
+    int vbX = 200, vbY = 126, vbW = 36, vbH = 6;
+    sprite1.drawRect(vbX, vbY, vbW, vbH, 0x4208);
+    int fillW = (int)(liveData.media_volume / 30.0f * (vbW - 2));
+    sprite1.fillRect(vbX + 1, vbY + 1, fillW, vbH - 2, TFT_CYAN);
+    sprite1.setTextSize(1);
+    sprite1.setTextColor(0x6B6D);
+    sprite1.setCursor(vbX - 14, vbY - 1);
+    sprite1.printf("%2d", liveData.media_volume);
   }
 
   sprite1.pushSprite(0, 0);
@@ -1390,18 +1657,25 @@ void renderD1About() {
   sprite1.setCursor(4, 22);
   sprite1.print("km/h");
 
-  int tbX = 6, tbY = 34, tbW = 14, tbH = 96;
-  sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
-  int fillH = (int)(liveData.throttle_pct / 100.0f * (tbH - 2));
-  for (int y = 0; y < fillH; y++) {
-    float f = (float)y / (tbH - 2);
-    uint8_t r = (f < 0.5f) ? (uint8_t)(f * 2 * 200) : 200;
-    uint8_t g = (f < 0.5f) ? 200 : (uint8_t)((1.0f - f) * 2 * 200);
-    sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+  {
+    bool braking = liveData.throttle_pct < 0;
+    int pct = (int)fabsf(liveData.throttle_pct);
+    int tbX = 6, tbY = 34, tbW = 14, tbH = 88;
+    sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
+    int fillH = (int)(pct / 100.0f * (tbH - 2));
+    for (int y = 0; y < fillH; y++) {
+      float f = (float)y / (tbH - 2);
+      uint8_t r, g;
+      if (braking) { r = 200; g = (uint8_t)((1.0f - f) * 60); }
+      else if (f < 0.5f) { r = (uint8_t)(f * 2 * 200); g = 200; }
+      else { r = 200; g = (uint8_t)((1.0f - f) * 2 * 200); }
+      sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+    }
+    sprite1.setTextColor(0x6B6D);
+    sprite1.setCursor(0, 126);
+    if (rtcTime.valid) sprite1.printf("%02d:%02d", rtcTime.hour, rtcTime.minute);
+    else sprite1.printf("%d%%", pct);
   }
-  sprite1.setTextColor(0x6B6D);
-  sprite1.setCursor(2, tbY + tbH + 2);
-  sprite1.printf("%d%%", (int)liveData.throttle_pct);
 
   // ── Right area: scrolling about text (28..239, 0..134) ──
   int txArea = 30, txW = 208;
@@ -1714,18 +1988,25 @@ void renderD1IMU() {
   sprite1.setCursor(4, 22);
   sprite1.print("km/h");
 
-  int tbX = 6, tbY = 34, tbW = 14, tbH = 76;
-  sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
-  int fillH = (int)(liveData.throttle_pct / 100.0f * (tbH - 2));
-  for (int y = 0; y < fillH; y++) {
-    float f = (float)y / (tbH - 2);
-    uint8_t r = (f < 0.5f) ? (uint8_t)(f * 2 * 200) : 200;
-    uint8_t g = (f < 0.5f) ? 200 : (uint8_t)((1.0f - f) * 2 * 200);
-    sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+  {
+    bool braking = liveData.throttle_pct < 0;
+    int pct = (int)fabsf(liveData.throttle_pct);
+    int tbX = 6, tbY = 34, tbW = 14, tbH = 76;
+    sprite1.drawRect(tbX, tbY, tbW, tbH, 0x2104);
+    int fillH = (int)(pct / 100.0f * (tbH - 2));
+    for (int y = 0; y < fillH; y++) {
+      float f = (float)y / (tbH - 2);
+      uint8_t r, g;
+      if (braking) { r = 200; g = (uint8_t)((1.0f - f) * 60); }
+      else if (f < 0.5f) { r = (uint8_t)(f * 2 * 200); g = 200; }
+      else { r = 200; g = (uint8_t)((1.0f - f) * 2 * 200); }
+      sprite1.drawFastHLine(tbX + 1, tbY + tbH - 2 - y, tbW - 2, sprite1.color565(r, g, 0));
+    }
+    sprite1.setTextColor(0x6B6D);
+    sprite1.setCursor(0, 126);
+    if (rtcTime.valid) sprite1.printf("%02d:%02d", rtcTime.hour, rtcTime.minute);
+    else sprite1.printf("%d%%", pct);
   }
-  sprite1.setTextColor(0x6B6D);
-  sprite1.setCursor(2, tbY + tbH + 2);
-  sprite1.printf("%d%%", (int)liveData.throttle_pct);
 
   sprite1.drawFastVLine(27, 0, 135, 0x2104);
 
@@ -1769,6 +2050,186 @@ void renderD1IMU() {
 
   sprite1.pushSprite(0, 0);
 }
+
+// ─── D1 Goggles IMU screen (240x135 landscape) ─────────────────────────────
+
+// Project a 3D point (x,y,z) by pitch/roll/yaw and return 2D screen coords
+static void project3D(float px, float py, float pz,
+                      float pitch, float roll, float yaw,
+                      int cx, int cy, float scale,
+                      int& sx, int& sy) {
+  float cp = cosf(pitch), sp = sinf(pitch);
+  float cr = cosf(roll),  sr = sinf(roll);
+  float ch = cosf(yaw),   sh = sinf(yaw);
+
+  // Rotate: yaw → pitch → roll
+  float x1 =  ch * px + sh * pz;
+  float z1 = -sh * px + ch * pz;
+  float y1 = py;
+
+  float y2 = cp * y1 - sp * z1;
+  float z2 = sp * y1 + cp * z1;
+  float x2 = x1;
+
+  float x3 = cr * x2 - sr * y2;
+  float y3 = sr * x2 + cr * y2;
+
+  // Simple orthographic projection
+  sx = cx + (int)(x3 * scale);
+  sy = cy - (int)(y3 * scale);
+}
+
+void renderD1Goggles() {
+  sprite1.fillScreen(TFT_BLACK);
+
+  float pitch = liveData.ht_pitch * PI / 180.0f;
+  float roll  = liveData.ht_roll  * PI / 180.0f;
+  float yaw   = liveData.ht_yaw   * PI / 180.0f;
+  float heading = liveData.ht_heading;
+
+  // ── Left half: 3D tapered goggles box ──
+  // Front face wider, back face narrower — makes rotation clearly visible
+  const float fw = 27, fh = 16;   // front half-width, half-height
+  const float bw = 18, bh = 12;   // back half-width, half-height (tapered)
+  const float hd = 10;            // half-depth
+  float verts[][3] = {
+    {-fw,-fh,-hd}, { fw,-fh,-hd}, { fw, fh,-hd}, {-fw, fh,-hd},  // front (wider)
+    {-bw,-bh, hd}, { bw,-bh, hd}, { bw, bh, hd}, {-bw, bh, hd},  // back (narrower)
+  };
+  // Edges: front face, back face, connecting edges
+  const int edges[][2] = {
+    {0,1},{1,2},{2,3},{3,0},  // front
+    {4,5},{5,6},{6,7},{7,4},  // back
+    {0,4},{1,5},{2,6},{3,7},  // sides
+  };
+
+  int cx = 60, cy = 65;
+  float scale = 1.1f;
+  int sx[8], sy[8];
+  for (int i = 0; i < 8; i++) {
+    project3D(verts[i][0], verts[i][1], verts[i][2],
+              pitch, roll, yaw, cx, cy, scale, sx[i], sy[i]);
+  }
+
+  // Draw back edges first (darker)
+  for (int i = 4; i < 8; i++) {
+    int a = edges[i][0], b = edges[i][1];
+    sprite1.drawLine(sx[a], sy[a], sx[b], sy[b], 0x4208);
+  }
+  // Side edges
+  for (int i = 8; i < 12; i++) {
+    int a = edges[i][0], b = edges[i][1];
+    sprite1.drawLine(sx[a], sy[a], sx[b], sy[b], 0x6B6D);
+  }
+  // Front face (brightest)
+  for (int i = 0; i < 4; i++) {
+    int a = edges[i][0], b = edges[i][1];
+    sprite1.drawLine(sx[a], sy[a], sx[b], sy[b], TFT_CYAN);
+  }
+  // Front face "lens" rectangles
+  {
+    int lx[4], ly[4], rx_[4], ry[4];
+    // Left lens: offset (-12, 0, -hd)
+    float lensVerts[][3] = {
+      {-24,-10,-hd-0.5f},{-4,-10,-hd-0.5f},{-4,10,-hd-0.5f},{-24,10,-hd-0.5f},  // left lens
+      {4,-10,-hd-0.5f},{24,-10,-hd-0.5f},{24,10,-hd-0.5f},{4,10,-hd-0.5f},       // right lens
+    };
+    int lsx[8], lsy[8];
+    for (int i = 0; i < 8; i++)
+      project3D(lensVerts[i][0], lensVerts[i][1], lensVerts[i][2],
+                pitch, roll, yaw, cx, cy, scale, lsx[i], lsy[i]);
+    // Draw lens rectangles
+    for (int l = 0; l < 2; l++) {
+      int o = l * 4;
+      uint16_t col = sprite1.color565(0, 40, 80);
+      sprite1.drawLine(lsx[o], lsy[o], lsx[o+1], lsy[o+1], col);
+      sprite1.drawLine(lsx[o+1], lsy[o+1], lsx[o+2], lsy[o+2], col);
+      sprite1.drawLine(lsx[o+2], lsy[o+2], lsx[o+3], lsy[o+3], col);
+      sprite1.drawLine(lsx[o+3], lsy[o+3], lsx[o], lsy[o], col);
+    }
+  }
+
+  // Labels
+  sprite1.setTextSize(1);
+  sprite1.setTextColor(0x4A69);
+  sprite1.setCursor(35, 1);
+  sprite1.print("GOGGLES");
+
+  // Pitch/Roll/Yaw text below cuboid
+  sprite1.setTextColor(0x8410);
+  sprite1.setCursor(10, 118);
+  sprite1.printf("P%+.0f R%+.0f Y%+.0f",
+                 liveData.ht_pitch, liveData.ht_roll, liveData.ht_yaw);
+
+  // ── Right half: compass ──
+  sprite1.drawFastVLine(120, 0, 135, 0x2104);
+
+  int compX = 180, compY = 60, compR = 45;
+
+  // Compass circle
+  sprite1.drawCircle(compX, compY, compR, 0x4208);
+  sprite1.drawCircle(compX, compY, compR + 1, 0x2104);
+
+  // Cardinal tick marks + labels
+  const char* cardinals[] = {"N", "E", "S", "W"};
+  for (int i = 0; i < 4; i++) {
+    float ang = (i * 90.0f - heading) * PI / 180.0f;
+    float ca = cosf(ang), sa = sinf(ang);
+    // Outer tick
+    int ox = compX + (int)(compR * sa);
+    int oy = compY - (int)(compR * ca);
+    int ix = compX + (int)((compR - 8) * sa);
+    int iy = compY - (int)((compR - 8) * ca);
+    sprite1.drawLine(ix, iy, ox, oy, TFT_WHITE);
+    // Label
+    int lx = compX + (int)((compR - 16) * sa) - 3;
+    int ly = compY - (int)((compR - 16) * ca) - 4;
+    sprite1.setTextColor(i == 0 ? TFT_RED : TFT_WHITE);
+    sprite1.setCursor(lx, ly);
+    sprite1.print(cardinals[i]);
+  }
+
+  // Minor ticks every 30°
+  for (int d = 0; d < 360; d += 30) {
+    if (d % 90 == 0) continue;
+    float ang = (d - heading) * PI / 180.0f;
+    int ox = compX + (int)(compR * sinf(ang));
+    int oy = compY - (int)(compR * cosf(ang));
+    int ix = compX + (int)((compR - 4) * sinf(ang));
+    int iy = compY - (int)((compR - 4) * cosf(ang));
+    sprite1.drawLine(ix, iy, ox, oy, 0x6B6D);
+  }
+
+  // Heading pointer (triangle at top)
+  sprite1.fillTriangle(compX, compY - compR + 3,
+                       compX - 4, compY - compR + 10,
+                       compX + 4, compY - compR + 10, TFT_RED);
+
+  // Heading value in center
+  sprite1.setTextColor(TFT_WHITE);
+  sprite1.setTextSize(2);
+  char hdgTxt[8];
+  snprintf(hdgTxt, sizeof(hdgTxt), "%03d", (int)heading % 360);
+  sprite1.setCursor(compX - 17, compY - 7);
+  sprite1.print(hdgTxt);
+  sprite1.setTextSize(1);
+  sprite1.setCursor(compX + 19, compY - 3);
+  sprite1.print((char)247);  // degree symbol
+
+  // Label
+  sprite1.setTextColor(0x4A69);
+  sprite1.setCursor(155, 1);
+  sprite1.print("HEADING");
+
+  // Heading text below compass
+  sprite1.setTextColor(0x8410);
+  sprite1.setCursor(145, 118);
+  sprite1.printf("HDG %.1f%c", heading, (char)247);
+
+  sprite1.pushSprite(0, 0);
+}
+
+// ─── D1 Placeholder screen ─────────────────────────────────────────────────
 
 void renderD1Placeholder(const char* title) {
   sprite1.fillScreen(TFT_BLACK);
@@ -2068,45 +2529,51 @@ void renderD2SignalBattery() {
 
 // ─── D2 Media player screen ──────────────────────────────────────────────────
 
-const char* songNames[] = {
+// Fallback song names (used when no songs.txt loaded)
+static const char* fallbackSongNames[] = {
   "Bohemian Rhapsody", "Hotel California", "Stairway to Heaven",
   "Back in Black", "Sweet Child O'Mine", "Comfortably Numb",
   "Wish You Were Here", "Paranoid Android", "Smells Like Teen Spirit"
 };
-const char* artistNames[] = {
+static const char* fallbackArtistNames[] = {
   "Queen", "Eagles", "Led Zeppelin",
   "AC/DC", "Guns N' Roses", "Pink Floyd",
   "Pink Floyd", "Radiohead", "Nirvana"
 };
-const int songCount = 9;
+static const int fallbackSongCount = 9;
 
 bool mediaDrawn = false;
-int mediaSongIdx = 0;
-bool mediaPlaying = true;
-unsigned long lastSongChange = 0;
+static uint8_t prevMediaSong = 0xFF;
+static uint8_t prevMediaState = 0xFF;
 // Frequency band heights (smoothed)
 float freqBands[32] = {0};
 float freqTargets[32] = {0};
 
+// Get current song title/artist (from SD or fallback)
+static const char* currentSongTitle() {
+  uint8_t idx = liveData.media_song;
+  if (songCount > 0 && idx < songCount) return songTitles[idx];
+  if (idx < fallbackSongCount) return fallbackSongNames[idx];
+  return "Unknown";
+}
+static const char* currentSongArtist() {
+  uint8_t idx = liveData.media_song;
+  if (songCount > 0 && idx < songCount) return songArtists[idx];
+  if (idx < fallbackSongCount) return fallbackArtistNames[idx];
+  return "";
+}
+
 // Update media state + EQ bands (called every frame from loop, regardless of active screen)
 void updateMediaState() {
-  unsigned long now = millis();
-
-  // Auto-change song every 15-25 seconds
-  if (now - lastSongChange > 15000 + random(10000)) {
-    mediaSongIdx = (mediaSongIdx + 1) % songCount;
-    lastSongChange = now;
-    mediaDrawn = false;
-  }
-
-  // Toggle play/pause occasionally
-  if (random(500) == 0) {
-    mediaPlaying = !mediaPlaying;
+  // Detect song or state change from liveData
+  if (liveData.media_song != prevMediaSong || liveData.media_state != prevMediaState) {
+    prevMediaSong = liveData.media_song;
+    prevMediaState = liveData.media_state;
     mediaDrawn = false;
   }
 
   // Update EQ targets + smooth
-  if (mediaPlaying) {
+  if (liveData.media_state == 1) {  // playing
     if (random(3) == 0) {
       for (int i = 0; i < 32; i++) {
         float bassBoost = 1.0f - (float)i / 32 * 0.5f;
@@ -2132,10 +2599,11 @@ void renderD2Media() {
 
     // Album art placeholder (colored square)
     int artX = (172 - 80) / 2, artY = 18, artS = 80;
+    uint8_t si = liveData.media_song;
     uint16_t artCol = disp2.color565(
-      40 + (mediaSongIdx * 23) % 80,
-      30 + (mediaSongIdx * 37) % 60,
-      50 + (mediaSongIdx * 41) % 90
+      40 + (si * 23) % 80,
+      30 + (si * 37) % 60,
+      50 + (si * 41) % 90
     );
     disp2.fillRoundRect(artX, artY, artS, artS, 8, artCol);
     // Music note icon
@@ -2149,14 +2617,14 @@ void renderD2Media() {
     // Song name
     disp2.setTextSize(1);
     disp2.setTextColor(TFT_WHITE);
-    const char* song = songNames[mediaSongIdx];
+    const char* song = currentSongTitle();
     int sw = strlen(song) * 6;
     disp2.setCursor(max(0, (172 - sw) / 2), 108);
     disp2.print(song);
 
     // Artist
     disp2.setTextColor(0x8410);
-    const char* artist = artistNames[mediaSongIdx];
+    const char* artist = currentSongArtist();
     int aw = strlen(artist) * 6;
     disp2.setCursor(max(0, (172 - aw) / 2), 122);
     disp2.print(artist);
@@ -2173,6 +2641,12 @@ void renderD2Media() {
     disp2.fillTriangle(130, cy + 8, 120, cy, 120, cy + 16, 0x8410);
     disp2.fillTriangle(142, cy + 8, 132, cy, 132, cy + 16, 0x8410);
 
+    // Volume bar label
+    disp2.setTextSize(1);
+    disp2.setTextColor(0x6B6D);
+    disp2.setCursor(12, 180);
+    disp2.print("VOL");
+
     disp2.endWrite();
     mediaDrawn = true;
     // Reset freq bands
@@ -2181,18 +2655,34 @@ void renderD2Media() {
 
   disp2.startWrite();
 
+  // Volume bar (only redraw on change)
+  {
+    static uint8_t prevVol = 255;
+    if (liveData.media_volume != prevVol) {
+      prevVol = liveData.media_volume;
+      int vbX = 36, vbY = 179, vbW = 120, vbH = 8;
+      int fillW = (int)(liveData.media_volume / 30.0f * (vbW - 2));
+      disp2.fillRect(vbX + 1, vbY + 1, vbW - 2, vbH - 2, TFT_BLACK);
+      disp2.drawRect(vbX, vbY, vbW, vbH, 0x4208);
+      disp2.fillRect(vbX + 1, vbY + 1, fillW, vbH - 2, TFT_CYAN);
+    }
+  }
+
   // Progress bar (animated)
   float progress = fmodf(now * 0.00003f, 1.0f);
   int progW = (int)(progress * 144);
   disp2.fillRoundRect(14, 142, progW, 2, 1, TFT_CYAN);
 
-  // Play/pause button (center, update each frame)
+  // Play/pause/stop button (center, update each frame)
   int cy = 158;
   disp2.fillRect(76, cy - 2, 20, 20, TFT_BLACK);
-  if (mediaPlaying) {
+  if (liveData.media_state == 1) {
     // Pause icon (two bars)
     disp2.fillRect(79, cy, 5, 16, TFT_WHITE);
     disp2.fillRect(88, cy, 5, 16, TFT_WHITE);
+  } else if (liveData.media_state == 0) {
+    // Stop icon (square)
+    disp2.fillRect(79, cy, 14, 16, 0x8410);
   } else {
     // Play icon (triangle)
     disp2.fillTriangle(80, cy, 80, cy + 16, 94, cy + 8, TFT_WHITE);
@@ -2294,7 +2784,7 @@ void renderD2Debug() {
 
   // Drive
   snprintf(buf, sizeof(buf), "%.1f km/h", liveData.speed_kmh); pv(TFT_WHITE, buf);
-  snprintf(buf, sizeof(buf), "%d%%", (int)liveData.throttle_pct); pv(TFT_WHITE, buf);
+  snprintf(buf, sizeof(buf), "%s %d%%", liveData.throttle_pct < 0 ? "BRK" : "THR", (int)fabsf(liveData.throttle_pct)); pv(TFT_WHITE, buf);
   snprintf(buf, sizeof(buf), "%d", liveData.rpm); pv(TFT_WHITE, buf);
   snprintf(buf, sizeof(buf), "0x%02X s=%d", liveData.motor_state, liveData.steer_pos); pv(TFT_WHITE, buf);
   sep();
@@ -2374,6 +2864,7 @@ void renderD1() {
     case D1_MEDIA:       renderD1Media(); break;
     case D1_ABOUT:       renderD1About(); break;
     case D1_IMU:         renderD1IMU(); break;
+    case D1_GOGGLES:     renderD1Goggles(); break;
     default: break;
   }
 }
@@ -2392,9 +2883,12 @@ void renderD2() {
     d2PrevScreen = d2Screen;
   }
 
+  // Pause heavy map rendering while menu is open (keeps menu responsive)
+  bool skipMap = menuIsActive() && (d2Screen == D2_NAVIGATION || d2Screen == D2_MAP);
+
   switch (d2Screen) {
-    case D2_NAVIGATION:  renderD2Navigation(); break;
-    case D2_MAP:         renderMap(); break;
+    case D2_NAVIGATION:  if (!skipMap) renderD2Navigation(); break;
+    case D2_MAP:         if (!skipMap) renderMap(); break;
     case D2_BATTERY:     renderD2Battery(); break;
     case D2_MEDIA:       renderD2Media(); break;
     case D2_SIGNAL:      renderD2SignalBattery(); break;
@@ -2714,6 +3208,31 @@ void processSerialCommands() {
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
 
+// ─── Core 0 task: D1 rendering + I2C (independent of D2 map rendering) ──────
+
+void d1Core0Task(void* param) {
+  // Wait for setup() to finish display init (LEDC channels 0,1 for backlights)
+  while (appState != STATE_NAVIGATE && appState != STATE_WEBSERVER) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  servoSetup();
+  const TickType_t interval = pdMS_TO_TICKS(33);  // ~30 FPS
+  for (;;) {
+    if (appState == STATE_NAVIGATE) {
+      parseI2CMessage();
+      checkI2CTimeout();
+      updateMediaState();
+      if (!liveData.masterPresent && !navRoute.waitingForGPS) {
+        updateLiveDataFromSim();
+      }
+      servoUpdate();
+      __sync_synchronize();
+      renderD1();
+    }
+    vTaskDelay(interval);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("GPS Nav Demo starting...");
@@ -2771,9 +3290,19 @@ void setup() {
 
   SD.mkdir("/tiles");
   SD.mkdir("/routes");
+  SD.mkdir("/music");
+  loadSongList();
   loadScreenState();
   setupI2CSlave();
-  servoSetup();
+
+  // RTC on Wire (GPIO 12=SDA, 32=SCL)
+  if (rtcInit()) {
+    rtcRead();
+    if (rtcTime.valid) {
+      rtcSyncSystemClock();  // set ESP32 internal clock from RTC
+    }
+  }
+
   loadActiveRoute();
 
   // Init simulation — load grid from cache, fall back to full scan
@@ -2814,6 +3343,9 @@ void setup() {
     webServerStarted = true;
     wifiActive = true;
 
+    // Sync RTC from NTP if WiFi connected
+    if (staConnected) rtcSyncFromNTP();
+
     // Show both IPs
     char line1[40], line2[40], line3[40], line5[40];
     snprintf(line1, sizeof(line1), "AP: GPSNav");
@@ -2838,6 +3370,9 @@ void setup() {
   showD1("GPS Nav Demo", "", "Starting nav...");
   delay(1000);
   appState = STATE_NAVIGATE;
+
+  // Run D1 rendering + I2C on core 0 (core 1 = Arduino loop = D2 rendering)
+  xTaskCreatePinnedToCore(d1Core0Task, "D1", 8192, NULL, 1, NULL, 0);
 }
 
 // ─── Loop ────────────────────────────────────────────────────────────────────
@@ -2853,29 +3388,11 @@ void loop() {
       navInitDone = true;
     }
     checkScreenButton();
-    parseI2CMessage();
-    checkI2CTimeout();
     processSerialCommands();
 
-    // Menu navigation via I2C steering/throttle
-    if (menuIsActive() && liveData.masterPresent) {
-      static unsigned long lastSteerAction = 0;
-      static bool throttleWasHigh = false;
-      // Steer left (< 80) / right (> 175) to browse
-      if (millis() - lastSteerAction > 400) {
-        if (liveData.steer_pos < 80) { menuPrev(); lastSteerAction = millis(); }
-        else if (liveData.steer_pos > 175) { menuNext(); lastSteerAction = millis(); }
-      }
-      // Throttle to full (>90%) then back to 0 (<10%) to confirm/enter
-      if (liveData.throttle_pct > 90) throttleWasHigh = true;
-      if (throttleWasHigh && liveData.throttle_pct < 10) {
-        throttleWasHigh = false;
-        menuEnter();
-      }
-    }
+    pollMenuInput();
 
     if (!navRoute.waitingForGPS) updateSim();
-    updateMediaState();
 
     // Navigation update at 2Hz
     { static unsigned long lastNavUpdate = 0;
@@ -2887,24 +3404,48 @@ void loop() {
       }
     }
 
-    // Populate LiveData: from I2C master if present, otherwise from simulation
-    if (!liveData.masterPresent && !navRoute.waitingForGPS) {
-      updateLiveDataFromSim();
-    }
-
     // Preview overrides liveData position/heading AFTER sim (takes priority)
     if (menu.previewMode) {
       updatePreview();
     }
 
-    servoUpdate();
+    // Time: use ESP32 system clock for display (fast, no I2C)
+    // Sync vehicle every 10s, re-read physical RTC every 60s
+    { static unsigned long lastRtcFastMs = 0;
+      static unsigned long lastRtcSyncMs = 0;
+      static unsigned long lastRtcHwMs = 0;
+      unsigned long now = millis();
+      // Fast: read system clock at 2 Hz for display
+      if (now - lastRtcFastMs >= 500) {
+        lastRtcFastMs = now;
+        rtcGetSystemTime();  // reads ESP32 internal clock, no I2C
+      }
+      // Re-sync ESP32 clock from physical RTC every 60s (compensate drift)
+      if (now - lastRtcHwMs >= 60000) {
+        lastRtcHwMs = now;
+        rtcRead();
+        if (rtcTime.valid) rtcSyncSystemClock();
+        rtcNtpTick();
+      }
+      // Send time to vehicle every 10s
+      if (now - lastRtcSyncMs >= 10000) {
+        lastRtcSyncMs = now;
+        if (rtcTime.valid && liveData.masterPresent) {
+          vconfEnqueueEvent(0xFD, (int16_t)((rtcTime.hour << 8) | rtcTime.minute));
+          vconfEnqueueEvent(0xFC, (int16_t)((rtcTime.month << 8) | rtcTime.day));
+          vconfEnqueueEvent(0xFB, (int16_t)rtcTime.year);
+          vconfEnqueueEvent(0xF8, (int16_t)rtcTime.second);
+        }
+      }
+    }
+
     renderD2();
-    renderD1();
     break;
 
   // ── Web config mode ────────────────────────────────────────────────────────
   case STATE_WEBSERVER:
     webServer.handleClient();
+    rtcNtpTick();
 
     // Process web-triggered tile downloads
     if (dlJob.active && !dlJob.cancel) {

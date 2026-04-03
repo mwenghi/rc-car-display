@@ -155,8 +155,173 @@ async function saveRoute() {
   r = await fetch('/api/routes/finish', {method:'POST'});
   j = await r.json();
 
-  document.getElementById('status').textContent = j.ok ? 'Route saved: ' + fname : 'Error finishing route';
+  if (!j.ok) {
+    document.getElementById('status').textContent = 'Error finishing route';
+    return;
+  }
+  document.getElementById('status').textContent = 'Route saved: ' + fname + '. Generating images...';
+
+  // Step 4: Generate and upload route screenshots
+  let baseName = fname.replace(/\.rte$/, '');
+  try {
+    await generateRouteImages(baseName, pts);
+    document.getElementById('status').textContent = 'Route saved with images: ' + fname;
+  } catch(e) {
+    console.error('Image generation error:', e);
+    document.getElementById('status').textContent = 'Route saved (image gen failed): ' + fname;
+  }
   loadRoutes();
+}
+
+// Web Mercator helpers
+function latToMercY(lat) { return Math.log(Math.tan(Math.PI/4 + lat*Math.PI/360)); }
+function mercProject(lat, lon, bounds, w, h) {
+  // Uniform scale: fit bounds into canvas preserving Mercator aspect ratio
+  let lonSpan = bounds.maxLon - bounds.minLon;
+  let yTop = latToMercY(bounds.maxLat);
+  let yBot = latToMercY(bounds.minLat);
+  let mercSpan = yTop - yBot;
+  // Convert lon span to same Mercator units (degrees to radians-like)
+  let lonSpanRad = lonSpan * Math.PI / 180;
+  // Pick uniform scale that fits both axes, center the smaller one
+  let scaleX = w / lonSpanRad;
+  let scaleY = h / mercSpan;
+  let scale = Math.min(scaleX, scaleY);
+  let usedW = lonSpanRad * scale;
+  let usedH = mercSpan * scale;
+  let offX = (w - usedW) / 2;
+  let offY = (h - usedH) / 2;
+  let x = offX + (lon - bounds.minLon) * Math.PI / 180 * scale;
+  let y = offY + (yTop - latToMercY(lat)) * scale;
+  return [x, y];
+}
+
+function calcBounds(pts, padding) {
+  let minLat=90,maxLat=-90,minLon=180,maxLon=-180;
+  pts.forEach(p => { minLat=Math.min(minLat,p[0]); maxLat=Math.max(maxLat,p[0]); minLon=Math.min(minLon,p[1]); maxLon=Math.max(maxLon,p[1]); });
+  let dLat=(maxLat-minLat)*padding, dLon=(maxLon-minLon)*padding;
+  // Ensure minimum span to avoid division by zero
+  if (dLat < 0.0001) dLat = 0.001;
+  if (dLon < 0.0001) dLon = 0.001;
+  return {minLat:minLat-dLat, maxLat:maxLat+dLat, minLon:minLon-dLon, maxLon:maxLon+dLon};
+}
+
+function drawPath(ctx, pts, bounds, w, h, color, lineWidth) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  pts.forEach((p, i) => {
+    let [x, y] = mercProject(p[0], p[1], bounds, w, h);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function lon2tile(lon, z) { return Math.floor((lon+180)/360*Math.pow(2,z)); }
+function lat2tile(lat, z) { return Math.floor((1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*Math.pow(2,z)); }
+function tile2lon(x, z) { return x/Math.pow(2,z)*360-180; }
+function tile2lat(y, z) { let n=Math.PI-2*Math.PI*y/Math.pow(2,z); return 180/Math.PI*Math.atan(0.5*(Math.exp(n)-Math.exp(-n))); }
+
+function loadTileImage(z, x, y) {
+  return new Promise((resolve) => {
+    let img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = 'https://tile.openstreetmap.org/' + z + '/' + x + '/' + y + '.png';
+  });
+}
+
+async function generateRouteImages(baseName, pts) {
+  let bounds = calcBounds(pts, 0.15);
+  let HIRES = 1600;
+
+  // --- Image 1: Map + path (native tile resolution, no skew) ---
+  document.getElementById('status').textContent = 'Generating map image...';
+
+  // Pick highest zoom where tile count stays manageable (max 64 tiles)
+  let z = 10;
+  for (let tz = 18; tz >= 10; tz--) {
+    let tx0 = lon2tile(bounds.minLon, tz), tx1 = lon2tile(bounds.maxLon, tz);
+    let ty0 = lat2tile(bounds.maxLat, tz), ty1 = lat2tile(bounds.minLat, tz);
+    if ((tx1-tx0+1)*(ty1-ty0+1) <= 64) { z = tz; break; }
+  }
+  let tx0 = lon2tile(bounds.minLon, z), tx1 = lon2tile(bounds.maxLon, z);
+  let ty0 = lat2tile(bounds.maxLat, z), ty1 = lat2tile(bounds.minLat, z);
+
+  // Tile bounds in geo coordinates
+  let tileGeoLeft = tile2lon(tx0, z), tileGeoRight = tile2lon(tx1+1, z);
+  let tileGeoTop = tile2lat(ty0, z), tileGeoBot = tile2lat(ty1+1, z);
+  let tileBounds = {minLat:tileGeoBot, maxLat:tileGeoTop, minLon:tileGeoLeft, maxLon:tileGeoRight};
+
+  // Canvas matches tile grid at native 256px per tile (no stretching)
+  let tilesW = tx1-tx0+1, tilesH = ty1-ty0+1;
+  let mapW = tilesW * 256, mapH = tilesH * 256;
+
+  let mapCanvas = document.createElement('canvas');
+  mapCanvas.width = mapW; mapCanvas.height = mapH;
+  let mctx = mapCanvas.getContext('2d');
+  mctx.fillStyle = '#2a2a3e';
+  mctx.fillRect(0, 0, mapW, mapH);
+
+  // Fetch and draw tiles at native 256x256
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      let img = await loadTileImage(z, tx, ty);
+      if (img) {
+        mctx.drawImage(img, (tx-tx0)*256, (ty-ty0)*256, 256, 256);
+      }
+    }
+  }
+  // Draw path on map using tile bounds
+  drawPath(mctx, pts, tileBounds, mapW, mapH, '#e94560', 4);
+  let [sx,sy] = mercProject(pts[0][0],pts[0][1],tileBounds,mapW,mapH);
+  let [ex,ey] = mercProject(pts[pts.length-1][0],pts[pts.length-1][1],tileBounds,mapW,mapH);
+  mctx.fillStyle='#00ff00'; mctx.beginPath(); mctx.arc(sx,sy,8,0,Math.PI*2); mctx.fill();
+  mctx.fillStyle='#ff0000'; mctx.beginPath(); mctx.arc(ex,ey,8,0,Math.PI*2); mctx.fill();
+
+  // --- Image 2: Path only high-res (transparent background) ---
+  document.getElementById('status').textContent = 'Generating path image...';
+  let pathCanvas = document.createElement('canvas');
+  pathCanvas.width = HIRES; pathCanvas.height = HIRES;
+  let pctx = pathCanvas.getContext('2d');
+  // Leave transparent (no fillRect)
+  drawPath(pctx, pts, bounds, HIRES, HIRES, '#e94560', 4);
+  [sx,sy] = mercProject(pts[0][0],pts[0][1],bounds,HIRES,HIRES);
+  [ex,ey] = mercProject(pts[pts.length-1][0],pts[pts.length-1][1],bounds,HIRES,HIRES);
+  pctx.fillStyle='#00ff00'; pctx.beginPath(); pctx.arc(sx,sy,8,0,Math.PI*2); pctx.fill();
+  pctx.fillStyle='#ff0000'; pctx.beginPath(); pctx.arc(ex,ey,8,0,Math.PI*2); pctx.fill();
+
+  // --- Image 3: Thumbnail 80x80 ---
+  let thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = 80; thumbCanvas.height = 80;
+  let tctx = thumbCanvas.getContext('2d');
+  tctx.fillStyle = '#1a1a2e';
+  tctx.fillRect(0, 0, 80, 80);
+  drawPath(tctx, pts, bounds, 80, 80, '#ffffff', 1.5);
+
+  // Upload all three
+  // Store large images as client-side blob URLs (too big for ESP32 RAM)
+  window._routeImages = window._routeImages || {};
+  window._routeImages[baseName + '_map'] = mapCanvas.toDataURL('image/png');
+  window._routeImages[baseName + '_path'] = pathCanvas.toDataURL('image/png');
+
+  // Only upload thumbnail to ESP32 (small enough: ~2-4KB)
+  document.getElementById('status').textContent = 'Uploading thumbnail...';
+  let thumbB64 = thumbCanvas.toDataURL('image/png').split(',')[1];
+  try {
+    let resp = await fetch('/api/routes/image?name=' + baseName + '_thumb.png', {
+      method: 'POST',
+      headers: {'Content-Type': 'text/plain'},
+      body: thumbB64
+    });
+    let j = await resp.json();
+    if (!j.ok) throw new Error(j.error || 'upload failed');
+  } catch(e) {
+    console.error('Thumb upload error:', e);
+  }
 }
 
 // Load and display routes
@@ -165,22 +330,40 @@ async function loadRoutes() {
     let r = await fetch('/api/routes');
     let j = await r.json();
     let html = '<table>';
-    if (j.routes.length === 0) html += '<tr><td colspan=4 style="color:#666">No routes</td></tr>';
+    if (j.routes.length === 0) html += '<tr><td colspan=5 style="color:#666">No routes</td></tr>';
     j.routes.forEach(rt => {
       let isActive = rt.active;
+      let base = rt.filename.replace(/\.rte$/, '');
       html += '<tr class="' + (isActive ? 'active-route' : '') + '">';
-      html += '<td>' + rt.name + '</td>';
+      html += '<td><img src="/api/routes/image?name=' + base + '_thumb.png" width=20 height=20 style="vertical-align:middle;border-radius:2px;background:#1a1a2e" onerror="this.style.display=\'none\'"> ' + rt.name + '</td>';
       html += '<td>' + rt.points + 'pts</td>';
       html += '<td>' + (rt.distance < 1000 ? rt.distance + 'm' : (rt.distance/1000).toFixed(1) + 'km') + '</td>';
-      html += '<td>';
+      html += '<td style="white-space:nowrap">';
       html += '<button class="btn btn-s" style="padding:1px 6px;font-size:10px" onclick="viewRoute(\'' + rt.filename + '\')">View</button> ';
       if (!isActive) html += '<button class="btn btn-p" style="padding:1px 6px;font-size:10px" onclick="activateRoute(\'' + rt.filename + '\')">Activate</button> ';
       html += '<button class="btn btn-d" style="padding:1px 6px;font-size:10px" onclick="deleteRoute(\'' + rt.filename + '\')">Del</button>';
-      html += '</td></tr>';
+      html += '</td>';
+      html += '<td><select style="font-size:10px;background:#0f3460;color:#aab;border:1px solid #333;border-radius:3px;padding:1px" onchange="dlRouteImg(\'' + base + '\',this.value);this.selectedIndex=0"><option>DL</option><option value="map">Map</option><option value="path">Path</option><option value="thumb">Thumb</option></select></td>';
+      html += '</tr>';
     });
     html += '</table>';
     document.getElementById('routeList').innerHTML = html;
   } catch(e) { document.getElementById('status').textContent = 'Error: ' + e.message; }
+}
+
+function dlRouteImg(base, type) {
+  if (!type) return;
+  let suffix = '_' + type + '.png';
+  let a = document.createElement('a');
+  a.download = base + suffix;
+  // Map/path are client-side only; thumb is on ESP32
+  let key = base + '_' + type;
+  if (window._routeImages && window._routeImages[key]) {
+    a.href = window._routeImages[key];
+  } else {
+    a.href = '/api/routes/image?name=' + base + suffix;
+  }
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 
 async function viewRoute(filename) {

@@ -5,12 +5,17 @@
 ```
 MEGA 2560 PRO Mini                     ESP32 (LilyGo T-Display v1.1)
 Pin 20 (SDA) ---- [Level Shifter] ---- GPIO 26 (SDA)
-Pin 21 (SCL) ---- [Level Shifter] ---- GPIO 32 (SCL)
+Pin 21 (SCL) ---- [Level Shifter] ---- GPIO 25 (SCL)
 GND          ---- [common ground] ---- GND
 
 Level Shifter: BSS138-based, HV=5V, LV=3.3V
-I2C speed: 400kHz (Fast Mode)
+I2C speed: 100kHz
 ESP32 Slave Address: 0x42
+
+SD2405 RTC (on ESP32 Wire bus):
+GPIO 12 (SDA) ---- SD2405 SDA
+GPIO 32 (SCL) ---- SD2405 SCL
+RTC I2C Address: 0x32
 ```
 
 ## Packet Format
@@ -28,9 +33,9 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 
 ## Message Types
 
-### 0x01 TELEMETRY_DRIVE (8 bytes payload, 20 Hz)
+### 0x01 TELEMETRY_DRIVE (8 bytes payload, 10 Hz)
 ```
-[0] throttle_pct     uint8    0-100 (%)
+[0] throttle_raw     uint8    0-255 (center=127, >127=fwd, <127=brake)
 [1] speed_kmh_x10_H  uint8    high byte of speed*10
 [2] speed_kmh_x10_L  uint8    low byte (0-2000 = 0.0-200.0 km/h)
 [3] rpm_x10_H        uint8    high byte of RPM/10
@@ -40,16 +45,16 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 [7] accel_trend      int8     speed delta indicator
 ```
 
-### 0x02 TELEMETRY_LINK (5 bytes payload, 5 Hz)
+### 0x02 TELEMETRY_LINK (5 bytes payload, 2 Hz)
 ```
-[0] rssi_dbm         int8     -128..0 dBm
-[1] link_quality     uint8    0-100 (%)
+[0] rssi_dbm         int8     -128..0 dBm (best of 2 antennas, from CRSF 0x14)
+[1] link_quality     uint8    0-100 (%) (from CRSF link stats)
 [2] rx_connected     uint8    0=lost, 1=connected
-[3] signal_bars      uint8    1-5
-[4] tx_power_dbm     uint8    0-30
+[3] signal_bars      uint8    0-5 (derived from LQ: >80%=5, >60%=4, >40%=3, >20%=2, else 1)
+[4] tx_power_dbm     uint8    0-30 (converted from CRSF TX power index)
 ```
 
-### 0x03 TELEMETRY_BATTERY (6 bytes payload, 2 Hz)
+### 0x03 TELEMETRY_BATTERY (6 bytes payload, 1 Hz)
 ```
 [0] voltage_x100_H   uint8    high byte of voltage*100
 [1] voltage_x100_L   uint8    low byte (e.g. 1184 = 11.84V)
@@ -59,7 +64,7 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 [5] flags            uint8    bits: [0]=charging [1]=low_warning [2]=critical
 ```
 
-### 0x04 TELEMETRY_GPS (17 bytes payload, 5 Hz)
+### 0x04 TELEMETRY_GPS (17 bytes payload, 2 Hz)
 ```
 [0..3]  latitude       int32    lat * 1e7
 [4..7]  longitude      int32    lon * 1e7
@@ -71,7 +76,7 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 [16]    _reserved      uint8
 ```
 
-### 0x05 TELEMETRY_NAV (10 bytes payload, 10 Hz)
+### 0x05 TELEMETRY_NAV (10 bytes payload, 5 Hz)
 ```
 [0..1]  heading_x10     uint16   heading * 10 (0-3599)
 [2..3]  course_x10      uint16   GPS course * 10
@@ -79,7 +84,7 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 [8..9]  heading_mag_x10 uint16   mag heading * 10
 ```
 
-### 0x06 TELEMETRY_SENSOR (14 bytes payload, 10 Hz)
+### 0x06 TELEMETRY_SENSOR (14 bytes payload, 5 Hz)
 ```
 [0..1]  accel_x_x100   int16    m/s^2 * 100
 [2..3]  accel_y_x100   int16
@@ -89,7 +94,7 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 [10..13] pressure_pa   uint32   Pa
 ```
 
-### 0x07 TELEMETRY_VEHICLE (6 bytes payload, 5 Hz)
+### 0x07 TELEMETRY_VEHICLE (6 bytes payload, 2 Hz)
 ```
 [0] state            uint8    0=OFF 1=STANDBY 2=ARMED
 [1] light_mode       uint8    0=off 1=parking 2=normal 3=distance
@@ -127,19 +132,26 @@ Max payload: 29 bytes (32 byte I2C buffer - 3 bytes overhead).
 ```
 
 **Menu structure (3-level):**
-- L1: Screen Select, Navigation, Vehicle
+- L1: Screen Select, Navigation, Vehicle, Restart
 - L2 (Screen Select): Display 1, Display 2
-- L2 (Navigation): Track Select, (Re)Start Nav, Stop Nav, Track Preview
+- L2 (Navigation): Track Select, (Re)Start Nav, Stop Nav, Track Preview, Stop Preview, Show/Hide Path
 - L2 (Vehicle): dynamic items defined by MEGA (see 0x20-0x24)
+- L2 (Restart): Restart Dashboard, Restart Vehicle
 - L3 (Display 1): Dashboard, Navigation, Media, IMU, About
-- L3 (Display 2): Navigation, Map, Battery, Signal, Media, Radio, Debug
-- L3 (Track Select): list of .rte files from SD
+- L3 (Display 2): Navigation, Map, Battery, Signal, Media, Debug
+- L3 (Track Select): horizontal thumbnail carousel of .rte files from SD
 - L3 (Vehicle submenu): children of a submenu-type item
 
+**Menu open/close:**
+- CH2 switch toggle (any direction) opens menu (1s debounce)
+- Menu close only via selecting Exit/Back items
+- Opening menu disarms motor and centers steering servo on Vehicle
+
 **Menu control via steering/throttle (when menu is active):**
-- Steer left (pos < 80): previous item
-- Steer right (pos > 175): next item
-- Throttle to full (>90%) then back to 0 (<10%): enter/confirm
+- Steer left (pos < 76): next item (~40% deflection)
+- Steer right (pos > 178): previous item (~40% deflection)
+- Throttle forward ~26% then back to ~0: enter/confirm
+- Vehicle steering servo and display servo disabled while menu is open
 
 ### 0x20 VCONF_DEFINE_ITEM (13-21 bytes payload, on event)
 Define or redefine a custom vehicle configuration menu item.
@@ -200,6 +212,17 @@ ESP32 responds with 4 bytes:
 Events: toggle (0/1), number (confirmed value), options (new index),
 action (value=1 when triggered). Queue holds up to 8 events.
 
+**Reserved event IDs (ESP32 → MEGA system events):**
+```
+0xFE  Menu state     value: 1=menu opened, 0=menu closed
+0xFD  Time (HH:MM)   value: high byte=hour (0-23), low byte=minute (0-59)
+0xFC  Date (MM.DD)   value: high byte=month (1-12), low byte=day (1-31)
+0xFB  Year           value: year (e.g. 2025)
+0xFA  Restart cmd    value: 1 = restart vehicle (MEGA resets)
+```
+Time events are sent every 10s from ESP32 RTC (SD2405).
+NTP sync: ESP32 syncs RTC via NTP when WiFi connected (TZ: CET/CEST Bratislava).
+
 **Item interaction on display:**
 - Toggle: Enter cycles on/off
 - Number: Enter starts edit → Up/Down adjust by step → Enter confirms
@@ -207,7 +230,7 @@ action (value=1 when triggered). Queue holds up to 8 events.
 - Action: Enter triggers immediately
 - Submenu: Enter opens child list
 
-### 0xFE HEARTBEAT (2 bytes payload, 2 Hz)
+### 0xFE HEARTBEAT (2 bytes payload, 1 Hz)
 ```
 [0..1] uptime_sec    uint16   MEGA uptime seconds (wraps at 65535)
 ```
@@ -222,17 +245,19 @@ action (value=1 when triggered). Queue holds up to 8 events.
 
 ## MEGA Transmission Schedule
 
-| Message | Interval | Bytes/sec |
-|---------|----------|-----------|
-| DRIVE   | 50ms     | 220       |
-| NAV     | 100ms    | 130       |
-| SENSOR  | 100ms    | 170       |
-| GPS     | 200ms    | 100       |
-| LINK    | 200ms    | 40        |
-| VEHICLE | 200ms    | 45        |
-| BATTERY | 500ms    | 18        |
-| HEARTBEAT| 500ms   | 10        |
-| **Total** |        | **~730 bytes/sec** (< 10% of 400kHz bus) |
+| Message   | Interval | Rate   |
+|-----------|----------|--------|
+| DRIVE     | 100ms    | 10 Hz  |
+| NAV       | 200ms    | 5 Hz   |
+| SENSOR    | 200ms    | 5 Hz   |
+| GPS       | 500ms    | 2 Hz   |
+| LINK      | 500ms    | 2 Hz   |
+| VEHICLE   | 500ms    | 2 Hz   |
+| BATTERY   | 1000ms   | 1 Hz   |
+| HEARTBEAT | 1000ms   | 1 Hz   |
+| POLL      | 200ms    | 5 Hz   |
+
+I2C timeout: 5ms (Wire.setWireTimeout). Bus recovery on timeout.
 
 ## Presence Detection
 

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Song List Editor</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:sans-serif;background:#1a1a2e;color:#e0e0e0;min-height:100vh;display:flex;flex-direction:column}
+.toolbar{background:#16213e;padding:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px}
+.btn{padding:5px 14px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600}
+.btn-p{background:#e94560;color:#fff}.btn-p:hover{background:#c73652}
+.btn-s{background:#0f3460;color:#aab}.btn-s:hover{background:#1a4a80}
+.btn-d{background:#6b2020;color:#e88}.btn-d:hover{background:#8b3030}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+h2{font-size:15px;color:#8899aa;font-weight:400}
+.container{flex:1;padding:10px;overflow-y:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:6px 8px;background:#0f3460;color:#8899aa;font-size:11px;text-transform:uppercase;position:sticky;top:0}
+td{padding:4px 6px;border-bottom:1px solid #111}
+tr:hover{background:#16213e}
+tr.playing{background:#1a2a4a}
+input[type=text]{background:#0d1b3e;color:#e0e0e0;border:1px solid #333;padding:4px 6px;border-radius:3px;font-size:12px;width:100%}
+.num{color:#555;width:30px;text-align:center;font-size:11px}
+.slot{color:#e94560;font-size:10px;width:50px;text-align:center}
+.actions{width:60px;text-align:center}
+.add-row{padding:8px;text-align:center}
+.status{background:#111;padding:6px 8px;font-size:11px;color:#666}
+.info{background:#0d1b3e;padding:6px 10px;font-size:11px;color:#667}
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <h2>Song List Editor</h2>
+  <button class="btn btn-p" onclick="saveSongs()">Save</button>
+  <button class="btn btn-s" onclick="addSong()">+ Add Song</button>
+  <button class="btn btn-s" onclick="loadSongs()">Reload</button>
+  <a href="/" class="btn btn-s" style="text-decoration:none">Back</a>
+</div>
+<div class="info">
+  Songs map to DY-SV5W files 33-52. Max 20 songs. Format: Title | Artist | Album.
+  Drag rows to reorder.
+</div>
+<div class="container">
+  <table>
+    <thead><tr><th>#</th><th>File</th><th>Title</th><th>Artist</th><th>Album</th><th></th></tr></thead>
+    <tbody id="songList"></tbody>
+  </table>
+  <div class="add-row">
+    <button class="btn btn-s" onclick="addSong()">+ Add Song</button>
+  </div>
+</div>
+<div class="status" id="status">Ready</div>
+
+<script>
+let songs = [];
+
+async function loadSongs() {
+  try {
+    let r = await fetch('/api/songs');
+    let text = await r.text();
+    songs = [];
+    text.split('\n').forEach(line => {
+      line = line.trim();
+      if (!line || line[0] === '#') return;
+      let parts = line.split('|').map(s => s.trim());
+      songs.push({
+        title: parts[0] || '',
+        artist: parts[1] || '',
+        album: parts[2] || ''
+      });
+    });
+    renderList();
+    document.getElementById('status').textContent = 'Loaded ' + songs.length + ' songs';
+  } catch(e) {
+    document.getElementById('status').textContent = 'Error: ' + e.message;
+  }
+}
+
+function renderList() {
+  let html = '';
+  songs.forEach((s, i) => {
+    let fileNum = 33 + i;
+    html += '<tr draggable="true" data-idx="' + i + '" ondragstart="dragStart(event)" ondragover="dragOver(event)" ondrop="drop(event)">';
+    html += '<td class="num">' + (i + 1) + '</td>';
+    html += '<td class="slot">' + String(fileNum).padStart(5, '0') + '.mp3</td>';
+    html += '<td><input type="text" value="' + esc(s.title) + '" onchange="songs[' + i + '].title=this.value" placeholder="Song title"></td>';
+    html += '<td><input type="text" value="' + esc(s.artist) + '" onchange="songs[' + i + '].artist=this.value" placeholder="Artist"></td>';
+    html += '<td><input type="text" value="' + esc(s.album) + '" onchange="songs[' + i + '].album=this.value" placeholder="Album"></td>';
+    html += '<td class="actions">';
+    if (i > 0) html += '<span style="cursor:pointer;color:#667" onclick="moveUp(' + i + ')">▲</span> ';
+    if (i < songs.length - 1) html += '<span style="cursor:pointer;color:#667" onclick="moveDown(' + i + ')">▼</span> ';
+    html += ' <span style="cursor:pointer;color:#e94560" onclick="removeSong(' + i + ')">✕</span>';
+    html += '</td></tr>';
+  });
+  document.getElementById('songList').innerHTML = html;
+}
+
+function esc(s) { return s.replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+
+function addSong() {
+  if (songs.length >= 20) { alert('Maximum 20 songs'); return; }
+  songs.push({ title: '', artist: '', album: '' });
+  renderList();
+  // Focus the new title input
+  let inputs = document.querySelectorAll('#songList input');
+  if (inputs.length) inputs[inputs.length - 3].focus();
+}
+
+function removeSong(idx) {
+  songs.splice(idx, 1);
+  renderList();
+}
+
+function moveUp(idx) {
+  if (idx <= 0) return;
+  [songs[idx - 1], songs[idx]] = [songs[idx], songs[idx - 1]];
+  renderList();
+}
+
+function moveDown(idx) {
+  if (idx >= songs.length - 1) return;
+  [songs[idx], songs[idx + 1]] = [songs[idx + 1], songs[idx]];
+  renderList();
+}
+
+// Drag and drop reordering
+let dragIdx = -1;
+function dragStart(e) { dragIdx = parseInt(e.target.closest('tr').dataset.idx); }
+function dragOver(e) { e.preventDefault(); }
+function drop(e) {
+  e.preventDefault();
+  let targetIdx = parseInt(e.target.closest('tr').dataset.idx);
+  if (dragIdx < 0 || targetIdx < 0 || dragIdx === targetIdx) return;
+  let item = songs.splice(dragIdx, 1)[0];
+  songs.splice(targetIdx, 0, item);
+  renderList();
+}
+
+async function saveSongs() {
+  // Read latest values from inputs
+  let rows = document.querySelectorAll('#songList tr');
+  rows.forEach((row, i) => {
+    let inputs = row.querySelectorAll('input');
+    if (inputs.length >= 3) {
+      songs[i].title = inputs[0].value.trim();
+      songs[i].artist = inputs[1].value.trim();
+      songs[i].album = inputs[2].value.trim();
+    }
+  });
+
+  // Build file content
+  let lines = ['# Song list for MP3 player (auto-generated)'];
+  lines.push('# Format: title | artist | album');
+  lines.push('# Songs map to DY-SV5W files 33-52');
+  songs.forEach(s => {
+    if (s.title || s.artist || s.album) {
+      lines.push(s.title + ' | ' + s.artist + ' | ' + s.album);
+    }
+  });
+  let content = lines.join('\n') + '\n';
+
+  document.getElementById('status').textContent = 'Saving...';
+  try {
+    let r = await fetch('/api/songs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: content
+    });
+    let j = await r.json();
+    if (j.ok) {
+      document.getElementById('status').textContent = 'Saved ' + songs.length + ' songs';
+    } else {
+      document.getElementById('status').textContent = 'Error: ' + (j.error || 'save failed');
+    }
+  } catch(e) {
+    document.getElementById('status').textContent = 'Error: ' + e.message;
+  }
+}
+
+loadSongs();
+</script>
+</body>
+</html>

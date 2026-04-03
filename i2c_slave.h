@@ -3,7 +3,7 @@
 
 // I2C config
 #define I2C_SDA_PIN  26
-#define I2C_SCL_PIN  32
+#define I2C_SCL_PIN  25
 #define I2C_ADDR     0x42
 
 // Message types
@@ -14,10 +14,12 @@
 #define MSG_NAV       0x05
 #define MSG_SENSOR    0x06
 #define MSG_VEHICLE   0x07
+#define MSG_HEAD_TRACKER 0x08
 #define MSG_CMD_SCREEN     0x10
 #define MSG_CMD_BRIGHTNESS 0x11
 #define MSG_CMD_MEDIA      0x12
 #define MSG_CMD_MENU       0x13  // menu navigation control
+#define MSG_MEDIA_STATE    0x14  // media playback state from vehicle
 #define MSG_VCONF_DEFINE   0x20  // define custom menu item
 #define MSG_VCONF_OPTION   0x21  // option label for options-type item
 #define MSG_VCONF_UPDATE   0x22  // update item value
@@ -80,6 +82,18 @@ struct LiveData {
   bool forward;
   bool horn_active;
   uint8_t video_camera;
+
+  // Head tracker (from CRSF channels)
+  float ht_heading;   // degrees 0-360
+  float ht_pitch;     // degrees ±180
+  float ht_roll;      // degrees ±180
+  float ht_yaw;       // degrees ±180
+
+  // Media state (0x14)
+  uint8_t media_state;    // 0=stopped, 1=playing, 2=paused
+  uint8_t media_song;     // current song index 0-19
+  uint8_t media_flags;    // bit0=system_sound_active
+  uint8_t media_volume;   // 0-30
 
   // Meta
   bool masterPresent;
@@ -147,7 +161,11 @@ void parseI2CMessage() {
   switch (msgType) {
     case MSG_DRIVE:
       if (len >= 11) {
-        liveData.throttle_pct = p[0];
+        { // raw 0-255, center 127: above = forward throttle, below = brake
+          int raw = (int)p[0] - 127;
+          if (raw > 0) liveData.throttle_pct = raw * 100.0f / 128.0f;
+          else         liveData.throttle_pct = raw * 100.0f / 127.0f;
+        }
         liveData.speed_kmh = ((uint16_t)p[1] << 8 | p[2]) / 10.0f;
         liveData.rpm = ((uint16_t)p[3] << 8 | p[4]) * 10;
         liveData.motor_state = p[5];
@@ -230,6 +248,30 @@ void parseI2CMessage() {
         liveData.forward = (p[3] == 0);
         liveData.horn_active = p[4];
         liveData.video_camera = p[5];
+      }
+      break;
+
+    case MSG_HEAD_TRACKER:
+      if (len >= 11) {
+        // 4x int16: heading_x10, pitch_x10, roll_x10, yaw_x10
+        int16_t hd, pt, rl, yw;
+        memcpy(&hd, p+0, 2);
+        memcpy(&pt, p+2, 2);
+        memcpy(&rl, p+4, 2);
+        memcpy(&yw, p+6, 2);
+        liveData.ht_heading = hd / 10.0f;
+        liveData.ht_pitch   = pt / 10.0f;
+        liveData.ht_roll    = rl / 10.0f;
+        liveData.ht_yaw     = yw / 10.0f;
+      }
+      break;
+
+    case MSG_MEDIA_STATE:
+      if (len >= 6) {
+        liveData.media_state = p[0];
+        liveData.media_song = p[1];
+        liveData.media_flags = p[2];
+        if (len >= 7) liveData.media_volume = p[3];
       }
       break;
 
@@ -320,7 +362,7 @@ extern float simX, simY, simHeading, simSpeed, simKmh, simThrottle;
 
 void updateLiveDataFromSim() {
   liveData.speed_kmh = simKmh;
-  liveData.throttle_pct = simThrottle;
+  liveData.throttle_pct = simThrottle;  // sim already 0-100 (forward only)
   liveData.rpm = (uint16_t)(simThrottle / 100.0f * 0.7f + simKmh / 200.0f * 0.3f) * 8000;
   liveData.heading_deg = fmodf(simHeading * 180.0f / PI + 360.0f, 360.0f);
 
@@ -363,12 +405,20 @@ void updateLiveDataFromSim() {
   liveData.masterPresent = false;
 }
 
+void onI2CRequest();  // forward declaration for reinit
+
 // ─── Check master timeout ────────────────────────────────────────────────────
 
 void checkI2CTimeout() {
   if (liveData.masterPresent && millis() - liveData.lastReceiveMs > I2C_TIMEOUT_MS) {
     liveData.masterPresent = false;
-    Serial.println("I2C: master timeout, switching to simulation");
+    // Reinitialize I2C slave — a bus glitch may have corrupted its state
+    Wire1.end();
+    delay(10);
+    Wire1.begin(I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN, 100000);
+    Wire1.onReceive(onI2CReceive);
+    Wire1.onRequest(onI2CRequest);
+    Serial.println("I2C: master timeout, slave reinit");
   }
 }
 
@@ -383,7 +433,7 @@ void onI2CRequest() {
 // ─── Init I2C slave ──────────────────────────────────────────────────────────
 
 void setupI2CSlave() {
-  Wire1.begin(I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN, 400000);
+  Wire1.begin(I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN, 100000);
   Wire1.onReceive(onI2CReceive);
   Wire1.onRequest(onI2CRequest);
   Serial.printf("I2C slave on 0x%02X (SDA=%d SCL=%d)\n", I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
