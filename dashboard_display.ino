@@ -26,9 +26,6 @@
 #define BTN_BOOT  0
 #define BTN_USER  35  // second built-in button (input-only GPIO)
 
-// Steering wheel servo — pin defined here, functions after i2c_slave.h include
-#define SERVO_PIN  2
-
 // WiFi
 const char* WIFI_SSID = "Chewifi";
 const char* WIFI_PASS = "1236987456";
@@ -47,7 +44,7 @@ void saveTileGridCache();
 bool loadTileGridCache();
 
 // Static PNG buffer in BSS — doesn't touch heap, leaves room for drawPng's zlib
-static uint8_t pngBuf[40000] __attribute__((aligned(4)));
+static uint8_t pngBuf[30000] __attribute__((aligned(4)));
 
 // ─── Display 1: Built-in T-Display (VSPI) ───────────────────────────────────
 
@@ -131,12 +128,14 @@ enum D1Screen {
 
 // D2 screens (Waveshare, 172x320)
 enum D2Screen {
-  D2_NAVIGATION = 0,  // map top + nav arrows bottom
-  D2_MAP,             // full OSM tile map
-  D2_BATTERY,         // battery indicator
-  D2_SIGNAL,          // signal + battery combo
-  D2_MEDIA,           // media player
-  D2_DEBUG,           // placeholder
+  D2_NAVIGATION = 0,    // map top + nav arrows bottom
+  D2_MAP,               // full OSM tile map
+  D2_BATTERY,           // battery indicator
+  D2_SIGNAL,            // signal + battery combo
+  D2_MEDIA,             // media player
+  D2_DEBUG,             // placeholder
+  D2_KITT_VOICEBOX,     // K.I.T.T. voice modulator (no buttons, fullscreen)
+  D2_KITT_VOICEBOX_BTN, // K.I.T.T. voice modulator + side buttons
   D2_SCREEN_COUNT
 };
 
@@ -156,8 +155,18 @@ int songCount = 0;
 D1Screen d1PrevScreen = D1_DASHBOARD;
 D2Screen d2PrevScreen = D2_NAVIGATION;
 
+// ─── Display brightness (percent 0..100, persisted in /brightness.cfg) ──────
+// D1 keeps a non-zero floor so the on-board screen is always visible.
+// D2 is allowed to go fully off.
+#define BRIGHTNESS_STEP    5
+#define BRIGHTNESS_MIN_D1  5
+#define BRIGHTNESS_MIN_D2  0
+uint8_t g_brightD1 = 80;   // percent
+uint8_t g_brightD2 = 80;
+static inline uint8_t pctTo255(uint8_t pct) { return (uint16_t)pct * 255 / 100; }
+
 const char* d1ScreenNames[] = {"Dashboard", "Navigation", "Media", "IMU", "About", "Goggles"};
-const char* d2ScreenNames[] = {"Navigation", "Map", "Battery", "Signal", "Media", "Debug"};
+const char* d2ScreenNames[] = {"Navigation", "Map", "Battery", "Signal", "Media", "Debug", "Voicebox", "Voicebox+B"};
 
 // Forward declarations for sdAcquire/sdRelease (defined in web_server.h)
 void sdAcquire();
@@ -170,6 +179,34 @@ void saveScreenState() {
   if (f) {
     f.printf("%d %d\n", (int)d1Screen, (int)d2Screen);
     f.close();
+  }
+  sdRelease();
+}
+
+void saveBrightnessState() {
+  sdAcquire();
+  File f = SD.open("/brightness.cfg", FILE_WRITE);
+  if (f) {
+    f.printf("%u %u\n", (unsigned)g_brightD1, (unsigned)g_brightD2);
+    f.close();
+  }
+  sdRelease();
+}
+
+void loadBrightnessState() {
+  sdAcquire();
+  if (SD.exists("/brightness.cfg")) {
+    File f = SD.open("/brightness.cfg", FILE_READ);
+    if (f) {
+      int b1 = f.parseInt();
+      int b2 = f.parseInt();
+      f.close();
+      // Stored values are percent (0..100). Anything bigger is from the old
+      // 0..255 schema — discard and let the default stand.
+      if (b1 >= BRIGHTNESS_MIN_D1 && b1 <= 100) g_brightD1 = (uint8_t)b1;
+      if (b2 >= BRIGHTNESS_MIN_D2 && b2 <= 100) g_brightD2 = (uint8_t)b2;
+      Serial.printf("Loaded brightness: D1=%u%% D2=%u%%\n", g_brightD1, g_brightD2);
+    }
   }
   sdRelease();
 }
@@ -252,98 +289,11 @@ void checkScreenButton() {
 #include "navigation.h"
 #include "web_server.h"
 #include "rtc_sd2405.h"
+#include "img_rear.h"
+#include "img_side.h"
 
-// ─── Steering wheel servo (continuous rotation) ──────────────────────────────
-// CR servo: 1500µs = stop, <1500 = CW, >1500 = CCW
-// steer_pos 0-255 (128=center) → target ±180° (1 turn lock-to-lock)
-// Open-loop P-controller with full-speed return to center
-
-#define SERVO_SPEED_DPS  200.0f   // degrees/sec at ±500µs — calibrate this
-
-static float servoAngle = 0.0f;  // estimated current angle (degrees)
-
-#include "driver/mcpwm_prelude.h"
-static mcpwm_cmpr_handle_t _servoCmp = NULL;
-static bool _servoOk = false;
-
-void servoSetup() {
-  mcpwm_timer_handle_t timer = NULL;
-  mcpwm_timer_config_t tcfg = {};
-  tcfg.group_id = 0;
-  tcfg.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT;
-  tcfg.resolution_hz = 1000000;  // 1µs per tick
-  tcfg.count_mode = MCPWM_TIMER_COUNT_MODE_UP;
-  tcfg.period_ticks = 20000;     // 20ms = 50Hz
-  if (mcpwm_new_timer(&tcfg, &timer) != ESP_OK) {
-    Serial.println("[Servo] timer FAILED"); return;
-  }
-
-  mcpwm_oper_handle_t oper = NULL;
-  mcpwm_operator_config_t ocfg = {};
-  ocfg.group_id = 0;
-  mcpwm_new_operator(&ocfg, &oper);
-  mcpwm_operator_connect_timer(oper, timer);
-
-  mcpwm_comparator_config_t ccfg = {};
-  ccfg.flags.update_cmp_on_tez = true;
-  mcpwm_new_comparator(oper, &ccfg, &_servoCmp);
-
-  mcpwm_gen_handle_t gen = NULL;
-  mcpwm_generator_config_t gcfg = {};
-  gcfg.gen_gpio_num = SERVO_PIN;
-  mcpwm_new_generator(oper, &gcfg, &gen);
-
-  // PWM: HIGH on timer empty (period start), LOW on compare match
-  mcpwm_generator_set_action_on_timer_event(gen,
-    MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH));
-  mcpwm_generator_set_action_on_compare_event(gen,
-    MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, _servoCmp, MCPWM_GEN_ACTION_LOW));
-
-  mcpwm_comparator_set_compare_value(_servoCmp, 1500);  // 1500µs = stop
-  mcpwm_timer_enable(timer);
-  mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP);
-
-  _servoOk = true;
-  Serial.printf("[Servo] MCPWM pin %d: OK\n", SERVO_PIN);
-}
-
-void servoUpdate() {
-  if (!_servoOk) return;
-
-  // Disable servo in simulation / track preview / menu mode
-  if (!liveData.masterPresent || menu.previewMode || menuIsActive()) {
-    mcpwm_comparator_set_compare_value(_servoCmp, 1500);  // stop
-    servoAngle = 0;
-    return;
-  }
-
-  static unsigned long prevMs = 0;
-  unsigned long now = millis();
-  float dt = constrain((now - prevMs) * 0.001f, 0.0f, 0.1f);
-  prevMs = now;
-
-  // Inverted: negate target direction
-  float target = -((liveData.steer_pos - 128.0f) / 128.0f * 180.0f);
-  float err = target - servoAngle;
-
-  int us;
-  if (fabsf(err) < 5.0f) {
-    us = 1500;                                           // dead zone — stop
-    servoAngle = target;                                 // snap to prevent drift
-  } else {
-    bool returning = fabsf(target) < fabsf(servoAngle);  // moving toward center?
-    int dev;
-    if (returning) {
-      dev = (err > 0) ? 500 : -500;                      // full speed to center
-    } else {
-      dev = (int)constrain(err * 3.0f, -500.0f, 500.0f); // proportional to turn
-    }
-    us = constrain(1500 + dev, 1000, 2000);
-    servoAngle += (dev / 500.0f) * SERVO_SPEED_DPS * dt;
-    servoAngle = constrain(servoAngle, -180.0f, 180.0f);
-  }
-  mcpwm_comparator_set_compare_value(_servoCmp, us);
-}
+// Steering wheel indicator servo is now driven by the Vehicle board
+// (reclaims GPIO 2 on the dashboard for the second display's backlight).
 
 // Simulation
 float simX, simY, simHeading, simSpeed;
@@ -1042,6 +992,528 @@ void renderD2Navigation() {
   disp2.setCursor(80, 300); disp2.setTextColor(0x8C71); disp2.printf("%.4fN", lat);
 
   disp2.endWrite();
+}
+
+// ─── Themed D1 Dashboard renderers ─────────────────────────────────────────
+// All themes display the same data as the Default dashboard (renderNavInfo);
+// only colours and layout vary per the theme inspiration set.
+
+void renderNavInfo();             // Default — original layout
+void renderD1DashboardKITT();     // kitt.png       — black + red 7-seg + yellow + LED bars
+void renderD1DashboardPolice();   // Interface 6    — black + blue/red blocks
+void renderD1DashboardSciFi();    // Interface 2    — dark blue + cyan holographic
+void renderD1DashboardRetro();    // Interface 1    — black + amber backlit classic dial
+
+void renderD1DashboardThemed() {
+  switch (liveData.theme) {
+    case 1: renderD1DashboardKITT();   break;
+    case 2: renderD1DashboardPolice(); break;
+    case 3: renderD1DashboardSciFi();  break;
+    case 4: renderD1DashboardRetro();  break;
+    case 0:
+    default: renderNavInfo();          break;
+  }
+}
+
+// ── Tiny shared helpers ──────────────────────────────────────────────────────
+// Blinker phase used across themes (500 ms toggle)
+static inline bool _themeBlinkPhase() { return (millis() / 500) % 2 == 0; }
+
+// Status icons (blinkers / lights / brake) drawn in a single colour palette
+static void _drawStatusIcons(int x, int y, uint16_t accent, uint16_t off,
+                             uint16_t lightOn, uint16_t brakeOn) {
+  bool blink = _themeBlinkPhase();
+  uint8_t b = liveData.blinker_state;
+  bool lOn = (b & 0x01) && blink;
+  bool rOn = (b & 0x02) && blink;
+  bool haz = (b & 0x04) && blink;
+  // Left arrow
+  uint16_t lc = (lOn || haz) ? accent : off;
+  sprite1.fillTriangle(x, y+8, x+8, y+2, x+8, y+14, lc);
+  sprite1.fillRect(x+8, y+5, 6, 6, lc);
+  // Right arrow
+  int rx = x + 24;
+  uint16_t rc = (rOn || haz) ? accent : off;
+  sprite1.fillTriangle(rx+14, y+8, rx+6, y+2, rx+6, y+14, rc);
+  sprite1.fillRect(rx, y+5, 6, 6, rc);
+  // Headlight icon (mode 0=off,1=parking,2=normal,3=distance)
+  int hx = x + 48;
+  uint16_t hc = (liveData.light_mode >= 2) ? lightOn
+              : (liveData.light_mode == 1) ? off
+              :                              off;
+  sprite1.fillCircle(hx+7, y+8, 4, hc);
+  sprite1.drawLine(hx+12, y+4,  hx+18, y+2,  hc);
+  sprite1.drawLine(hx+12, y+8,  hx+19, y+8,  hc);
+  sprite1.drawLine(hx+12, y+12, hx+18, y+14, hc);
+  // Brake circle with !
+  int bx = x + 72;
+  uint16_t bc = (liveData.motor_state & 0x08) ? brakeOn : off;
+  sprite1.drawCircle(bx+7, y+8, 7, bc);
+  sprite1.fillRect(bx+6, y+3,  3, 7, bc);
+  sprite1.fillRect(bx+6, y+12, 3, 2, bc);
+}
+
+// ─── KITT theme ──────────────────────────────────────────────────────────────
+// kitt.png: black background, top horizontal LED gauge (green→yellow→red),
+// huge red 7-seg-style speed digits, yellow text labels, LED bar throttle.
+void renderD1DashboardKITT() {
+  sprite1.fillScreen(TFT_BLACK);
+
+  const uint16_t YEL = TFT_YELLOW;
+  const uint16_t RED = TFT_RED;
+  const uint16_t GRN = sprite1.color565(0, 200, 0);
+  const uint16_t DIM = 0x4208;
+
+  // Top horizontal LED arc — 0..200 km/h gradient gauge
+  int gx = 5, gy = 4, gw = 230, gh = 12;
+  float maxSpeed = 200.0f;
+  float kmh = constrain(liveData.speed_kmh, 0.0f, maxSpeed);
+  int filled = (int)(kmh / maxSpeed * (gw - 2));
+  for (int x = 0; x < (gw - 2); x++) {
+    float f = (float)x / (gw - 2);
+    uint16_t col;
+    if      (f < 0.5f)  col = GRN;
+    else if (f < 0.75f) col = YEL;
+    else                col = RED;
+    if (x < filled) sprite1.drawFastVLine(gx + 1 + x, gy + 1, gh - 2, col);
+    else            sprite1.drawFastVLine(gx + 1 + x, gy + 1, gh - 2, DIM);
+  }
+  sprite1.drawRect(gx, gy, gw, gh, DIM);
+  sprite1.setTextSize(1); sprite1.setTextColor(YEL);
+  for (int s = 0; s <= 200; s += 50) {
+    int xt = gx + (int)((float)s / 200 * (gw - 2)) - (s >= 100 ? 8 : 4);
+    sprite1.setCursor(xt, gy + gh + 2);
+    sprite1.printf("%d", s);
+  }
+
+  // Big red 7-seg-style speed (size 5 = 30x40 chars)
+  sprite1.setTextSize(5);
+  sprite1.setTextColor(RED);
+  char spd[4]; snprintf(spd, sizeof(spd), "%03d", (int)kmh);
+  sprite1.setCursor(8, 38);
+  sprite1.print(spd);
+  sprite1.setTextSize(2);
+  sprite1.setTextColor(RED);
+  sprite1.setCursor(8, 80);
+  sprite1.print("KM/H");
+
+  // Right column — throttle + steer LED bars
+  int rx = 110;
+  bool braking = liveData.throttle_pct < 0;
+  int  pct     = (int)fabsf(liveData.throttle_pct);
+  sprite1.setTextSize(1); sprite1.setTextColor(YEL);
+  sprite1.setCursor(rx, 38); sprite1.print(braking ? "BRAKE" : "THROTTLE");
+  sprite1.setCursor(rx + 100, 38); sprite1.printf("%3d", pct);
+  int tw = 125, th = 9;
+  int tFilled = (int)(pct / 100.0f * (tw - 2));
+  for (int x = 0; x < tFilled; x++) {
+    float f = (float)x / (tw - 2);
+    uint16_t col = braking ? RED : (f < 0.5f ? GRN : (f < 0.75f ? YEL : RED));
+    sprite1.drawFastVLine(rx + 1 + x, 49, th - 2, col);
+  }
+  sprite1.drawRect(rx, 48, tw, th, DIM);
+
+  int sPct = (int)((liveData.steer_pos - 128) * 100 / 127);
+  sprite1.setTextColor(YEL);
+  sprite1.setCursor(rx, 62); sprite1.print("STEER");
+  sprite1.setCursor(rx + 100, 62); sprite1.printf("%+4d", sPct);
+  int sBarY = 72;
+  sprite1.drawRect(rx, sBarY, tw, th, DIM);
+  int center = tw / 2;
+  sprite1.drawFastVLine(rx + center, sBarY + 1, th - 2, YEL);
+  float sFrac = constrain((liveData.steer_pos - 128) / 127.0f, -1.0f, 1.0f);
+  int sFill = (int)(fabsf(sFrac) * (center - 1));
+  for (int x = 0; x < sFill; x++) {
+    int xx = (sFrac < 0) ? rx + center - 1 - x : rx + center + 1 + x;
+    sprite1.drawFastVLine(xx, sBarY + 1, th - 2, YEL);
+  }
+
+  // Status row
+  _drawStatusIcons(8, 88, sprite1.color565(255, 200, 0), DIM, YEL, RED);
+
+  // State / dir / horn (yellow)
+  const char* stateTxt;
+  switch (liveData.vehicle_state) {
+    case 1: stateTxt = "STBY"; break;
+    case 2: stateTxt = "ARM";  break;
+    default: stateTxt = "OFF"; break;
+  }
+  sprite1.setTextSize(1); sprite1.setTextColor(YEL);
+  sprite1.setCursor(110, 92); sprite1.print(stateTxt);
+  sprite1.setCursor(140, 92); sprite1.print(liveData.forward ? "FWD" : "REV");
+  if (liveData.horn_active) { sprite1.setCursor(170, 92); sprite1.print("HORN"); }
+  sprite1.setCursor(110, 104); sprite1.printf("HDG %.0f", liveData.heading_deg);
+
+  // Time (red 7-seg-ish, large) + date (yellow small)
+  if (rtcTime.valid) {
+    sprite1.setTextSize(2); sprite1.setTextColor(RED);
+    sprite1.setCursor(8, 116);
+    sprite1.printf("%02d:%02d:%02d", rtcTime.hour, rtcTime.minute, rtcTime.second);
+    sprite1.setTextSize(1); sprite1.setTextColor(YEL);
+    sprite1.setCursor(155, 122);
+    sprite1.printf("%02d.%02d.%04d", rtcTime.day, rtcTime.month, rtcTime.year);
+  }
+
+  sprite1.pushSprite(0, 0);
+}
+
+// ─── Sci-fi theme ────────────────────────────────────────────────────────────
+// Interface 2: dark, cyan holographic. Round speed gauge with cyan arc and
+// thin needle, square-bracket HUD frames around stats.
+void renderD1DashboardSciFi() {
+  sprite1.fillScreen(0x0001);   // near-black with subtle blue cast
+
+  const uint16_t CYN  = TFT_CYAN;
+  const uint16_t CYND = sprite1.color565(0, 100, 130);
+  const uint16_t WHT  = TFT_WHITE;
+  const uint16_t DIM  = sprite1.color565(0, 60, 90);
+  const uint16_t WARN = sprite1.color565(255, 80, 80);
+
+  // Round speedometer (left)
+  int gx = 60, gy = 64, gr = 52;
+  float startA = -210.0f, endA = 30.0f, sweep = endA - startA;
+  float maxSpeed = 200.0f;
+  float kmh = constrain(liveData.speed_kmh, 0.0f, maxSpeed);
+
+  // Outer dim ring
+  for (int a = (int)startA; a <= (int)endA; a += 1) {
+    float r = a * PI / 180.0f;
+    int ox = gx + (int)(gr * cosf(r));
+    int oy = gy + (int)(gr * sinf(r));
+    int ix = gx + (int)((gr - 2) * cosf(r));
+    int iy = gy + (int)((gr - 2) * sinf(r));
+    sprite1.drawLine(ix, iy, ox, oy, DIM);
+  }
+  // Filled cyan arc up to current speed
+  float frac = kmh / maxSpeed;
+  int upTo = (int)(startA + frac * sweep);
+  for (int a = (int)startA; a <= upTo; a += 1) {
+    float r = a * PI / 180.0f;
+    int ox = gx + (int)((gr + 3) * cosf(r));
+    int oy = gy + (int)((gr + 3) * sinf(r));
+    int ix = gx + (int)((gr + 1) * cosf(r));
+    int iy = gy + (int)((gr + 1) * sinf(r));
+    sprite1.drawLine(ix, iy, ox, oy, CYN);
+  }
+
+  // Tick labels (every 50)
+  sprite1.setTextSize(1); sprite1.setTextColor(CYND);
+  for (int s = 0; s <= 200; s += 50) {
+    float ang = (startA + s / maxSpeed * sweep) * PI / 180.0f;
+    int lx = gx + (int)((gr - 14) * cosf(ang)) - 5;
+    int ly = gy + (int)((gr - 14) * sinf(ang)) - 3;
+    sprite1.setCursor(lx, ly); sprite1.printf("%d", s);
+  }
+
+  // Big speed digit — cyan, centred
+  sprite1.setTextSize(3); sprite1.setTextColor(CYN);
+  char spd[4]; snprintf(spd, sizeof(spd), "%3d", (int)kmh);
+  sprite1.setCursor(gx - 26, gy - 8); sprite1.print(spd);
+  sprite1.setTextSize(1); sprite1.setTextColor(CYND);
+  sprite1.setCursor(gx - 12, gy + 18); sprite1.print("km/h");
+
+  // Right HUD frames
+  int rx = 130, rw = 105;
+  // Frame brackets helper
+  auto bracket = [&](int x, int y, int w, int h) {
+    sprite1.drawLine(x, y, x + 4, y, CYND);
+    sprite1.drawLine(x, y, x, y + 4, CYND);
+    sprite1.drawLine(x + w - 4, y, x + w, y, CYND);
+    sprite1.drawLine(x + w, y, x + w, y + 4, CYND);
+    sprite1.drawLine(x, y + h - 4, x, y + h, CYND);
+    sprite1.drawLine(x, y + h, x + 4, y + h, CYND);
+    sprite1.drawLine(x + w - 4, y + h, x + w, y + h, CYND);
+    sprite1.drawLine(x + w, y + h - 4, x + w, y + h, CYND);
+  };
+
+  // THROTTLE block
+  bracket(rx, 4, rw, 22);
+  bool braking = liveData.throttle_pct < 0;
+  int  pct     = (int)fabsf(liveData.throttle_pct);
+  sprite1.setTextColor(CYND); sprite1.setTextSize(1);
+  sprite1.setCursor(rx + 4, 8); sprite1.print(braking ? "BRK" : "THR");
+  sprite1.setTextColor(braking ? WARN : CYN);
+  sprite1.setCursor(rx + 28, 8); sprite1.printf("%3d%%", pct);
+  int barW = rw - 8;
+  int fillW = (int)(pct / 100.0f * (barW));
+  sprite1.drawFastHLine(rx + 4, 20, barW, DIM);
+  sprite1.drawFastHLine(rx + 4, 20, fillW, braking ? WARN : CYN);
+
+  // STEER block
+  bracket(rx, 30, rw, 22);
+  int sPct = (int)((liveData.steer_pos - 128) * 100 / 127);
+  sprite1.setTextColor(CYND);
+  sprite1.setCursor(rx + 4, 34); sprite1.print("STR");
+  sprite1.setTextColor(CYN);
+  sprite1.setCursor(rx + 28, 34); sprite1.printf("%+4d", sPct);
+  int sBarMid = rx + 4 + barW / 2;
+  sprite1.drawFastHLine(rx + 4, 46, barW, DIM);
+  sprite1.drawFastVLine(sBarMid, 44, 4, CYND);
+  float sFrac = constrain((liveData.steer_pos - 128) / 127.0f, -1.0f, 1.0f);
+  int sFill = (int)(fabsf(sFrac) * (barW / 2));
+  if (sFrac < 0) sprite1.drawFastHLine(sBarMid - sFill, 46, sFill, CYN);
+  else           sprite1.drawFastHLine(sBarMid,         46, sFill, CYN);
+
+  // STATE block
+  bracket(rx, 56, rw, 22);
+  const char* st;
+  uint16_t stCol;
+  switch (liveData.vehicle_state) {
+    case 1: st = "STBY"; stCol = TFT_YELLOW; break;
+    case 2: st = "ARM";  stCol = TFT_GREEN;  break;
+    default: st = "OFF"; stCol = CYND;        break;
+  }
+  sprite1.setTextSize(1); sprite1.setTextColor(stCol);
+  sprite1.setCursor(rx + 4, 60); sprite1.print(st);
+  sprite1.setTextColor(liveData.forward ? CYN : sprite1.color565(255, 130, 0));
+  sprite1.setCursor(rx + 30, 60); sprite1.print(liveData.forward ? "FWD" : "REV");
+  if (liveData.horn_active) { sprite1.setTextColor(WARN); sprite1.setCursor(rx + 60, 60); sprite1.print("HORN"); }
+  sprite1.setTextColor(CYND);
+  sprite1.setCursor(rx + 4, 70); sprite1.printf("HDG %.0f", liveData.heading_deg);
+
+  // Status icons
+  _drawStatusIcons(8, 116, CYN, DIM, CYN, WARN);
+
+  // Time
+  if (rtcTime.valid) {
+    sprite1.setTextSize(2); sprite1.setTextColor(CYN);
+    sprite1.setCursor(rx, 84);
+    sprite1.printf("%02d:%02d", rtcTime.hour, rtcTime.minute);
+    sprite1.setTextSize(1); sprite1.setTextColor(CYND);
+    sprite1.setCursor(rx + 60, 90);
+    sprite1.printf(":%02d", rtcTime.second);
+    sprite1.setCursor(rx, 104);
+    sprite1.printf("%02d.%02d.%04d", rtcTime.day, rtcTime.month, rtcTime.year);
+  }
+
+  sprite1.pushSprite(0, 0);
+}
+
+// ─── Police theme ────────────────────────────────────────────────────────────
+// Interface 6: data-block layout with blue/red accents over black.
+void renderD1DashboardPolice() {
+  sprite1.fillScreen(TFT_BLACK);
+
+  const uint16_t BLU  = TFT_BLUE;
+  const uint16_t RED  = TFT_RED;
+  const uint16_t WHT  = TFT_WHITE;
+  const uint16_t GRY  = sprite1.color565(140, 140, 140);
+  const uint16_t DIM  = sprite1.color565(40, 40, 60);
+
+  // Top stripe — alternating blue/red flashes (theme accent)
+  bool phase = (millis() / 400) % 2 == 0;
+  sprite1.fillRect(0,   0, 120, 6, phase ? BLU : DIM);
+  sprite1.fillRect(120, 0, 120, 6, phase ? DIM : RED);
+
+  // Big speed (centre-left)
+  float kmh = constrain(liveData.speed_kmh, 0.0f, 999.0f);
+  sprite1.setTextSize(4); sprite1.setTextColor(WHT);
+  char spd[4]; snprintf(spd, sizeof(spd), "%3d", (int)kmh);
+  sprite1.setCursor(8, 16); sprite1.print(spd);
+  sprite1.setTextSize(1); sprite1.setTextColor(GRY);
+  sprite1.setCursor(8, 50); sprite1.print("km/h");
+
+  // Speed bar under speed
+  int barW = 100, barX = 8, barY = 60;
+  int barFill = (int)(kmh / 200.0f * barW);
+  sprite1.drawRect(barX, barY, barW, 6, DIM);
+  sprite1.drawFastHLine(barX + 1, barY + 1, barFill, RED);
+  sprite1.drawFastHLine(barX + 1, barY + 3, barFill, BLU);
+
+  // Right blocks — POWER / STEER / DIR
+  int rx = 116;
+  // THROTTLE / BRAKE block
+  sprite1.drawRect(rx, 8, 118, 30, DIM);
+  bool braking = liveData.throttle_pct < 0;
+  int  pct     = (int)fabsf(liveData.throttle_pct);
+  sprite1.setTextSize(1); sprite1.setTextColor(GRY);
+  sprite1.setCursor(rx + 4, 12); sprite1.print(braking ? "BRAKE" : "POWER");
+  sprite1.setTextSize(2); sprite1.setTextColor(braking ? RED : WHT);
+  sprite1.setCursor(rx + 60, 14); sprite1.printf("%3d", pct);
+  sprite1.setTextSize(1); sprite1.setCursor(rx + 100, 22); sprite1.print("%");
+  // mini bar
+  int tF = (int)(pct / 100.0f * 110);
+  sprite1.drawFastHLine(rx + 4, 33, 110, DIM);
+  sprite1.drawFastHLine(rx + 4, 33, tF, braking ? RED : BLU);
+
+  // STEER block
+  sprite1.drawRect(rx, 42, 118, 24, DIM);
+  int sPct = (int)((liveData.steer_pos - 128) * 100 / 127);
+  sprite1.setTextColor(GRY);
+  sprite1.setCursor(rx + 4, 46); sprite1.print("STEER");
+  sprite1.setTextColor(WHT);
+  sprite1.setCursor(rx + 80, 46); sprite1.printf("%+4d", sPct);
+  int mid = rx + 4 + 110 / 2;
+  sprite1.drawFastHLine(rx + 4, 60, 110, DIM);
+  sprite1.drawFastVLine(mid, 58, 4, GRY);
+  float sFrac = constrain((liveData.steer_pos - 128) / 127.0f, -1.0f, 1.0f);
+  int sFill = (int)(fabsf(sFrac) * 55);
+  if (sFrac < 0) sprite1.drawFastHLine(mid - sFill, 60, sFill, BLU);
+  else           sprite1.drawFastHLine(mid,         60, sFill, RED);
+
+  // STATE / DIR / HDG block
+  sprite1.drawRect(rx, 70, 118, 22, DIM);
+  const char* st;
+  uint16_t stCol;
+  switch (liveData.vehicle_state) {
+    case 1: st = "STBY"; stCol = TFT_YELLOW; break;
+    case 2: st = "ARMED"; stCol = TFT_GREEN; break;
+    default: st = "OFF";  stCol = GRY;       break;
+  }
+  sprite1.setTextSize(1); sprite1.setTextColor(stCol);
+  sprite1.setCursor(rx + 4, 75); sprite1.print(st);
+  sprite1.setTextColor(liveData.forward ? TFT_GREEN : TFT_ORANGE);
+  sprite1.setCursor(rx + 50, 75); sprite1.print(liveData.forward ? "FWD" : "REV");
+  if (liveData.horn_active) { sprite1.setTextColor(RED); sprite1.setCursor(rx + 84, 75); sprite1.print("SIRN"); }
+  sprite1.setTextColor(GRY);
+  sprite1.setCursor(rx + 4, 84); sprite1.printf("HDG %.0f", liveData.heading_deg);
+
+  // Status icons (left of time)
+  _drawStatusIcons(8, 96, BLU, DIM, WHT, RED);
+
+  // Time
+  if (rtcTime.valid) {
+    sprite1.setTextSize(2); sprite1.setTextColor(WHT);
+    sprite1.setCursor(rx, 96);
+    sprite1.printf("%02d:%02d:%02d", rtcTime.hour, rtcTime.minute, rtcTime.second);
+    sprite1.setTextSize(1); sprite1.setTextColor(GRY);
+    sprite1.setCursor(rx + 24, 116);
+    sprite1.printf("%02d.%02d.%04d", rtcTime.day, rtcTime.month, rtcTime.year);
+  }
+
+  sprite1.pushSprite(0, 0);
+}
+
+// ─── Retro theme ─────────────────────────────────────────────────────────────
+// Interface 1: classic round dial with amber needle on black, like vintage
+// instrument backlit panels. Warm palette only (no W tone).
+void renderD1DashboardRetro() {
+  sprite1.fillScreen(TFT_BLACK);
+
+  const uint16_t AMB  = sprite1.color565(255, 150, 0);   // amber
+  const uint16_t AMBD = sprite1.color565(110, 60, 0);    // dim amber
+  const uint16_t CRM  = sprite1.color565(220, 170, 60);  // cream
+  const uint16_t WARN = sprite1.color565(255, 60, 20);
+
+  // Round speedometer — full 270° sweep, amber face
+  int gx = 68, gy = 62, gr = 56;
+  float startA = -225.0f, endA = 45.0f, sweep = endA - startA;
+  float maxSpeed = 200.0f;
+  float kmh = constrain(liveData.speed_kmh, 0.0f, maxSpeed);
+
+  // Dial face
+  sprite1.fillCircle(gx, gy, gr, sprite1.color565(20, 12, 4));
+  // Dial rim
+  for (int a = (int)startA; a <= (int)endA; a += 1) {
+    float r = a * PI / 180.0f;
+    int ox = gx + (int)(gr * cosf(r));
+    int oy = gy + (int)(gr * sinf(r));
+    int ix = gx + (int)((gr - 3) * cosf(r));
+    int iy = gy + (int)((gr - 3) * sinf(r));
+    sprite1.drawLine(ix, iy, ox, oy, AMB);
+  }
+
+  // Major ticks every 40 + labels
+  sprite1.setTextSize(1); sprite1.setTextColor(CRM);
+  for (int s = 0; s <= 200; s += 40) {
+    float ang = (startA + s / maxSpeed * sweep) * PI / 180.0f;
+    int ox = gx + (int)((gr - 3) * cosf(ang));
+    int oy = gy + (int)((gr - 3) * sinf(ang));
+    int ix = gx + (int)((gr - 11) * cosf(ang));
+    int iy = gy + (int)((gr - 11) * sinf(ang));
+    sprite1.drawLine(ix, iy, ox, oy, CRM);
+    int lx = gx + (int)((gr - 19) * cosf(ang)) - (s >= 100 ? 8 : 4);
+    int ly = gy + (int)((gr - 19) * sinf(ang)) - 3;
+    sprite1.setCursor(lx, ly); sprite1.printf("%d", s);
+  }
+  // Minor ticks every 20
+  for (int s = 20; s < 200; s += 40) {
+    float ang = (startA + s / maxSpeed * sweep) * PI / 180.0f;
+    int ox = gx + (int)((gr - 3) * cosf(ang));
+    int oy = gy + (int)((gr - 3) * sinf(ang));
+    int ix = gx + (int)((gr - 7) * cosf(ang));
+    int iy = gy + (int)((gr - 7) * sinf(ang));
+    sprite1.drawLine(ix, iy, ox, oy, AMBD);
+  }
+
+  // Amber needle with cream tip
+  float needleAng = (startA + kmh / maxSpeed * sweep) * PI / 180.0f;
+  int nx = gx + (int)((gr - 14) * cosf(needleAng));
+  int ny = gy + (int)((gr - 14) * sinf(needleAng));
+  for (int d = -1; d <= 1; d++) {
+    sprite1.drawLine(gx + d, gy, nx + d, ny, AMB);
+    sprite1.drawLine(gx, gy + d, nx, ny + d, AMB);
+  }
+  sprite1.fillCircle(gx, gy, 6, sprite1.color565(80, 50, 20));
+  sprite1.fillCircle(gx, gy, 3, CRM);
+
+  // Digital readout under gauge
+  sprite1.setTextSize(2); sprite1.setTextColor(AMB);
+  char spd[8]; snprintf(spd, sizeof(spd), "%3d", (int)kmh);
+  sprite1.setCursor(gx - 18, gy + 28); sprite1.print(spd);
+  sprite1.setTextSize(1); sprite1.setTextColor(AMBD);
+  sprite1.setCursor(gx + 14, gy + 34); sprite1.print("kmh");
+
+  // Right column data, amber on black
+  int rx = 138;
+  bool braking = liveData.throttle_pct < 0;
+  int  pct     = (int)fabsf(liveData.throttle_pct);
+  sprite1.setTextSize(1); sprite1.setTextColor(CRM);
+  sprite1.setCursor(rx, 6); sprite1.print(braking ? "BRAKE" : "POWER");
+  sprite1.setTextColor(braking ? WARN : AMB);
+  sprite1.setCursor(rx + 60, 6); sprite1.printf("%3d%%", pct);
+  // amber bar
+  int barW = 96, barH = 6;
+  int filled = (int)(pct / 100.0f * (barW - 2));
+  sprite1.drawRect(rx, 16, barW, barH, AMBD);
+  sprite1.drawFastHLine(rx + 1, 18, filled, braking ? WARN : AMB);
+  sprite1.drawFastHLine(rx + 1, 19, filled, braking ? WARN : AMB);
+
+  int sPct = (int)((liveData.steer_pos - 128) * 100 / 127);
+  sprite1.setTextColor(CRM);
+  sprite1.setCursor(rx, 28); sprite1.print("STEER");
+  sprite1.setTextColor(AMB);
+  sprite1.setCursor(rx + 60, 28); sprite1.printf("%+4d", sPct);
+  int sBarY = 38;
+  sprite1.drawRect(rx, sBarY, barW, barH, AMBD);
+  int center = barW / 2;
+  sprite1.drawFastVLine(rx + center, sBarY + 1, barH - 2, CRM);
+  float sFrac = constrain((liveData.steer_pos - 128) / 127.0f, -1.0f, 1.0f);
+  int sFill = (int)(fabsf(sFrac) * (center - 1));
+  if (sFrac < 0) {
+    for (int x = 0; x < sFill; x++) sprite1.drawFastVLine(rx + center - 1 - x, sBarY + 1, barH - 2, AMB);
+  } else {
+    for (int x = 0; x < sFill; x++) sprite1.drawFastVLine(rx + center + 1 + x, sBarY + 1, barH - 2, AMB);
+  }
+
+  // Status icons
+  _drawStatusIcons(rx - 4, 50, AMB, AMBD, AMB, WARN);
+
+  // State / dir / horn / hdg (warm)
+  const char* st;
+  switch (liveData.vehicle_state) {
+    case 1: st = "STBY"; break;
+    case 2: st = "ARM";  break;
+    default: st = "OFF"; break;
+  }
+  sprite1.setTextColor(AMB);
+  sprite1.setCursor(rx, 72); sprite1.print(st);
+  sprite1.setCursor(rx + 28, 72); sprite1.print(liveData.forward ? "FWD" : "REV");
+  if (liveData.horn_active) { sprite1.setCursor(rx + 60, 72); sprite1.print("HORN"); }
+  sprite1.setTextColor(CRM);
+  sprite1.setCursor(rx, 84); sprite1.printf("HDG %.0f", liveData.heading_deg);
+
+  // Time + date
+  if (rtcTime.valid) {
+    sprite1.setTextSize(2); sprite1.setTextColor(AMB);
+    sprite1.setCursor(8, 116);
+    sprite1.printf("%02d:%02d:%02d", rtcTime.hour, rtcTime.minute, rtcTime.second);
+    sprite1.setTextSize(1); sprite1.setTextColor(AMBD);
+    sprite1.setCursor(rx, 124);
+    sprite1.printf("%02d.%02d.%04d", rtcTime.day, rtcTime.month, rtcTime.year);
+  }
+
+  sprite1.pushSprite(0, 0);
 }
 
 // ─── Nav info rendering (D1) ────────────────────────────────────────────────
@@ -1974,6 +2446,87 @@ static void drawTruckSide(LGFX_Sprite& s, int cx, int cy, float ang) {
   #undef R
 }
 
+// ─── IMU image rotation (direct from PROGMEM, zero heap) ────────────────────
+
+// Draw a PROGMEM RGB565 image rotated by `angle` degrees, centered at (cx,cy)
+// on the target sprite. Uses bilinear sampling. transColor = transparency key.
+// Read one pixel from PROGMEM image, returning native RGB565
+static inline uint16_t _readImgPixel(const uint16_t* img, int iw, int x, int y) {
+  uint16_t raw = pgm_read_word(&img[y * iw + x]);
+  return raw;  // already native RGB565 from generate_headers.sh
+}
+
+// Extract R/G/B components from RGB565
+static inline void _rgb565_unpack(uint16_t c, int& r, int& g, int& b) {
+  r = (c >> 11) & 0x1F;
+  g = (c >> 5)  & 0x3F;
+  b =  c        & 0x1F;
+}
+
+static inline uint16_t _rgb565_pack(int r, int g, int b) {
+  return ((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (b & 0x1F);
+}
+
+static void drawRotatedImage(LGFX_Sprite& dst, int cx, int cy,
+                             const uint16_t* img, int iw, int ih,
+                             float angle, float scale, uint16_t transColor) {
+  float rad = angle * (PI / 180.0f);
+  float hw = iw * 0.5f, hh = ih * 0.5f;
+  float maxR = sqrtf(hw*hw + hh*hh) * scale + 1;
+  int x0 = max(0, (int)(cx - maxR));
+  int y0 = max(0, (int)(cy - maxR));
+  int x1 = min((int)(dst.width() - 1),  (int)(cx + maxR));
+  int y1 = min((int)(dst.height() - 1), (int)(cy + maxR));
+
+  float invCos = cosf(-rad) / scale;
+  float invSin = sinf(-rad) / scale;
+
+  for (int dy = y0; dy <= y1; dy++) {
+    float fy = (float)(dy - cy);
+    for (int dx = x0; dx <= x1; dx++) {
+      float fx = (float)(dx - cx);
+      float sx = fx * invCos - fy * invSin + hw;
+      float sy = fx * invSin + fy * invCos + hh;
+
+      // Bilinear interpolation
+      int ix = (int)sx, iy = (int)sy;
+      if (ix < 0 || ix >= iw - 1 || iy < 0 || iy >= ih - 1) continue;
+
+      float fx1 = sx - ix, fy1 = sy - iy;
+      float fx0 = 1.0f - fx1, fy0 = 1.0f - fy1;
+
+      uint16_t p00 = _readImgPixel(img, iw, ix,   iy);
+      uint16_t p10 = _readImgPixel(img, iw, ix+1, iy);
+      uint16_t p01 = _readImgPixel(img, iw, ix,   iy+1);
+      uint16_t p11 = _readImgPixel(img, iw, ix+1, iy+1);
+
+      // Skip if all corners are transparent
+      if (p00 == transColor && p10 == transColor &&
+          p01 == transColor && p11 == transColor) continue;
+
+      int r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
+      _rgb565_unpack(p00, r00, g00, b00);
+      _rgb565_unpack(p10, r10, g10, b10);
+      _rgb565_unpack(p01, r01, g01, b01);
+      _rgb565_unpack(p11, r11, g11, b11);
+
+      // Weight transparent pixels as 0 contribution
+      float w00 = (p00 != transColor) ? fx0 * fy0 : 0;
+      float w10 = (p10 != transColor) ? fx1 * fy0 : 0;
+      float w01 = (p01 != transColor) ? fx0 * fy1 : 0;
+      float w11 = (p11 != transColor) ? fx1 * fy1 : 0;
+      float wt = w00 + w10 + w01 + w11;
+      if (wt < 0.01f) continue;
+
+      int r = (int)((r00*w00 + r10*w10 + r01*w01 + r11*w11) / wt);
+      int g = (int)((g00*w00 + g10*w10 + g01*w01 + g11*w11) / wt);
+      int b = (int)((b00*w00 + b10*w10 + b01*w01 + b11*w11) / wt);
+
+      dst.drawPixel(dx, dy, _rgb565_pack(r, g, b));
+    }
+  }
+}
+
 void renderD1IMU() {
   sprite1.fillScreen(TFT_BLACK);
 
@@ -2010,11 +2563,12 @@ void renderD1IMU() {
 
   sprite1.drawFastVLine(27, 0, 135, 0x2104);
 
-  // ── IMU values ──
-  float roll  = constrain(liveData.accel_x, -1.0f, 1.0f);
-  float pitch = constrain(liveData.accel_y, -1.0f, 1.0f);
-  float rollAng  = roll  * 0.52f;   // max ±30°
-  float pitchAng = pitch * 0.52f;
+  // ── IMU angles (full rotation from accelerometer) ──
+  float ax = liveData.accel_x;
+  float ay = liveData.accel_y;
+  float az = liveData.accel_z;
+  float rollAng  = atan2f(ay, az) * (180.0f / PI);    // full ±180°
+  float pitchAng = atan2f(-ax, az) * (180.0f / PI);  // full ±180°
 
   // ── Labels ──
   sprite1.setTextSize(1);
@@ -2025,11 +2579,36 @@ void renderD1IMU() {
   // ── Divider ──
   sprite1.drawFastVLine(132, 0, 112, 0x18C3);
 
-  // ── Rear view (roll tilt) — left panel ──
-  drawTruckRear(sprite1, 80, 55, rollAng);
+  // ── Rear + Side views from embedded RGB565 images (zero heap) ──
+  drawRotatedImage(sprite1, 80, 55, img_rear, IMG_REAR_W, IMG_REAR_H,
+                   rollAng, 0.9f, TFT_BLACK);
+  drawRotatedImage(sprite1, 186, 55, img_side, IMG_SIDE_W, IMG_SIDE_H,
+                   -pitchAng, 0.9f, TFT_BLACK);
 
-  // ── Side view (pitch tilt) — right panel ──
-  drawTruckSide(sprite1, 186, 55, pitchAng);
+  // ── Angle warning borders ──
+  float absRoll  = fabsf(rollAng);
+  float absPitch = fabsf(pitchAng);
+
+  uint16_t rearBorderCol = 0;
+  if (absRoll >= 45) rearBorderCol = TFT_RED;
+  else if (absRoll >= 20) rearBorderCol = TFT_ORANGE;
+
+  uint16_t sideBorderCol = 0;
+  if (absPitch >= 45) sideBorderCol = TFT_RED;
+  else if (absPitch >= 20) sideBorderCol = TFT_ORANGE;
+
+  if (rearBorderCol) {
+    sprite1.drawRect(30, 10, 100, 90, rearBorderCol);
+    sprite1.drawRect(31, 11, 98, 88, rearBorderCol);
+  }
+  if (sideBorderCol) {
+    sprite1.drawRect(136, 10, 100, 90, sideBorderCol);
+    sprite1.drawRect(137, 11, 98, 88, sideBorderCol);
+  }
+
+  // ── Ground reference lines ──
+  sprite1.drawFastHLine(35, 90, 90, 0x18C3);
+  sprite1.drawFastHLine(140, 90, 95, 0x18C3);
 
   // ── Bottom 2 lines: IMU text data (indented past left column) ──
   int tx = 30;
@@ -2859,7 +3438,7 @@ void renderD1() {
   }
 
   switch (d1Screen) {
-    case D1_DASHBOARD:   renderNavInfo(); break;
+    case D1_DASHBOARD:   renderD1DashboardThemed(); break;
     case D1_NAVIGATION:  renderD1Navigation(); break;
     case D1_MEDIA:       renderD1Media(); break;
     case D1_ABOUT:       renderD1About(); break;
@@ -2869,7 +3448,175 @@ void renderD1() {
   }
 }
 
+// ─── K.I.T.T. voicebox screen (D2) ──────────────────────────────────────────
+// Three vertical columns of small LED-cell rectangles. Each column grows and
+// shrinks symmetrically from a horizontal centre line — represents sound
+// intensity, not frequency content. Cell deltas only (no fillScreen each
+// frame), so the panel doesn't flicker. Static parts (centre line + the
+// optional side buttons) are drawn once when the screen first appears.
+static bool voiceboxDrawn = false;
+
+void renderD2Voicebox(bool withButtons) {
+  const int N        = 12;            // cells per side of the centre line
+  const int cellH    = 6;
+  const int cellGap  = 2;
+  const int span     = cellH + cellGap;          // 8 px per cell
+  const int colW     = withButtons ? 18 : 28;    // slightly narrower per spec
+  const int colGap   = withButtons ? 10 : 22;
+  const int totalW   = 3 * colW + 2 * colGap;
+  const int x0       = (172 - totalW) / 2;
+  const int centerY  = 160;
+
+  static int8_t   level[3]    = { 0, 0, 0 };   // currently rendered cells
+  static int8_t   prevLvl[3]  = { 0, 0, 0 };
+  static int8_t   target[3]   = { 0, 0, 0 };
+  static uint32_t lastTargetMs = 0;
+  static uint32_t lastFrameMs  = 0;
+
+  // ── First-frame setup: clear, draw static elements, init bar state ───
+  if (!voiceboxDrawn) {
+    disp2.startWrite();
+    disp2.fillScreen(TFT_BLACK);
+    // Subtle red centre line so the symmetry pivot is visible at idle
+    disp2.drawFastHLine(0, centerY, 172, disp2.color565(50, 0, 0));
+
+    if (withButtons) {
+      // Left buttons
+      static const char* leftLbl[]  = { "AIR", "OIL", "P1", "P2" };
+      static const char* rightLbl[] = { "S1",  "S2",  "P3", "P4" };
+      uint16_t btnFill = disp2.color565(60, 50, 0);
+      const int btnW = 36, btnH = 38, btnGap = 8, btnY0 = 22;
+      for (uint8_t i = 0; i < 4; i++) {
+        int by = btnY0 + i * (btnH + btnGap);
+        disp2.fillRoundRect(2, by, btnW, btnH, 6, btnFill);
+        disp2.drawRoundRect(2, by, btnW, btnH, 6, TFT_YELLOW);
+        disp2.setTextSize(2);
+        disp2.setTextColor(TFT_YELLOW, btnFill);
+        int tx = 2 + (btnW - 12 * (int)strlen(leftLbl[i])) / 2;
+        disp2.setCursor(tx, by + 12);
+        disp2.print(leftLbl[i]);
+
+        int rxBtn = 172 - 2 - btnW;
+        disp2.fillRoundRect(rxBtn, by, btnW, btnH, 6, btnFill);
+        disp2.drawRoundRect(rxBtn, by, btnW, btnH, 6, TFT_YELLOW);
+        disp2.setTextSize(2);
+        disp2.setTextColor(TFT_YELLOW, btnFill);
+        int tx2 = rxBtn + (btnW - 12 * (int)strlen(rightLbl[i])) / 2;
+        disp2.setCursor(tx2, by + 12);
+        disp2.print(rightLbl[i]);
+      }
+      // Bottom row: AUTO CRUISE / NORMAL / PURSUIT
+      static const char* botLbl[] = { "CRUISE", "NORMAL", "PURSUIT" };
+      static const uint16_t botCol[] = {
+        TFT_YELLOW,                    // CRUISE — yellow
+        disp2.color565(255, 120, 0),   // NORMAL — orange
+        TFT_RED,                       // PURSUIT — red
+      };
+      uint16_t botFill = disp2.color565(40, 30, 0);
+      int bw = 52, bh = 26, bgap = 2;
+      int totW = 3 * bw + 2 * bgap;
+      int bx0 = (172 - totW) / 2;
+      for (uint8_t i = 0; i < 3; i++) {
+        int bx = bx0 + i * (bw + bgap);
+        int by = 286;
+        disp2.fillRoundRect(bx, by, bw, bh, 4, botFill);
+        disp2.drawRoundRect(bx, by, bw, bh, 4, botCol[i]);
+        disp2.setTextSize(1);
+        disp2.setTextColor(botCol[i], botFill);
+        int tx = bx + (bw - 6 * (int)strlen(botLbl[i])) / 2;
+        disp2.setCursor(tx, by + 10);
+        disp2.print(botLbl[i]);
+      }
+    }
+    disp2.endWrite();
+
+    for (uint8_t c = 0; c < 3; c++) {
+      level[c]   = 0;
+      prevLvl[c] = 0;
+      target[c]  = random(2, N);
+    }
+    voiceboxDrawn = true;
+  }
+
+  uint32_t now = millis();
+
+  // Pick new master "intensity" (~10 Hz). Centre column is ALWAYS the tallest;
+  // the two side columns share an identical, smaller height so the modulator
+  // reads as a single audio level rather than three independent signals.
+  if (now - lastTargetMs >= 100) {
+    lastTargetMs = now;
+    int master = random(3, N + 1);                    // 3..N (centre)
+    int side   = master - 1 - (int)random(0, 3);      // 1..3 cells shorter
+    if (side < 1) side = 1;
+    target[0] = side;
+    target[1] = master;
+    target[2] = side;
+  }
+
+  // Throttle frame to ~30 fps; smooth + draw deltas
+  if (now - lastFrameMs < 33) return;
+  lastFrameMs = now;
+
+  disp2.startWrite();
+  for (uint8_t c = 0; c < 3; c++) {
+    if      (level[c] < target[c]) level[c]++;
+    else if (level[c] > target[c]) level[c]--;
+
+    int8_t lv = level[c];
+    int8_t pv = prevLvl[c];
+    if (lv == pv) continue;
+
+    int x = x0 + c * (colW + colGap);
+
+    if (lv > pv) {
+      // Light up newly-added cells (above + below centre, symmetric).
+      // i = 0 is the cell next to the centre line; i = N-1 is the tip.
+      // Bright red at the centre, fading to dim red at the tip.
+      for (int8_t i = pv; i < lv; i++) {
+        uint8_t r = 255 - (uint8_t)((uint16_t)i * 175 / (N - 1));  // 255..80
+        uint16_t col = disp2.color565(r, 0, 0);
+        int yAbove = centerY - (i + 1) * span + cellGap;
+        int yBelow = centerY +  i      * span + cellGap;
+        disp2.fillRect(x, yAbove, colW, cellH, col);
+        disp2.fillRect(x, yBelow, colW, cellH, col);
+      }
+    } else {
+      // Erase shrunken cells
+      for (int8_t i = lv; i < pv; i++) {
+        int yAbove = centerY - (i + 1) * span + cellGap;
+        int yBelow = centerY +  i      * span + cellGap;
+        disp2.fillRect(x, yAbove, colW, cellH, TFT_BLACK);
+        disp2.fillRect(x, yBelow, colW, cellH, TFT_BLACK);
+      }
+    }
+    prevLvl[c] = lv;
+  }
+  disp2.endWrite();
+}
+
 void renderD2() {
+  // ── Auto-switch D2 to voicebox on KITT enter / restore on KITT exit ──
+  // Saves whatever screen the user had selected when KITT activates so it
+  // can be restored when they leave the theme. If the user manually picks a
+  // non-voicebox screen while still in KITT, that choice is respected.
+  static uint8_t   _lastTheme        = 0;
+  static D2Screen  _savedD2Screen    = D2_NAVIGATION;
+  if (liveData.theme != _lastTheme) {
+    if (liveData.theme == 1 /*KITT*/) {
+      if (d2Screen != D2_KITT_VOICEBOX && d2Screen != D2_KITT_VOICEBOX_BTN) {
+        _savedD2Screen = d2Screen;
+        d2Screen = D2_KITT_VOICEBOX;
+        Serial.printf("D2 -> Voicebox (KITT enter, saved %s)\n", d2ScreenNames[_savedD2Screen]);
+      }
+    } else if (_lastTheme == 1 /*was KITT, now leaving*/) {
+      if (d2Screen == D2_KITT_VOICEBOX || d2Screen == D2_KITT_VOICEBOX_BTN) {
+        d2Screen = _savedD2Screen;
+        Serial.printf("D2 -> %s (KITT exit, restored)\n", d2ScreenNames[d2Screen]);
+      }
+    }
+    _lastTheme = liveData.theme;
+  }
+
   // Clear on screen change
   if (d2Screen != d2PrevScreen) {
     disp2.startWrite();
@@ -2880,6 +3627,7 @@ void renderD2() {
     sigBattDrawn = false;
     mediaDrawn = false;
     debugDrawn = false;
+    voiceboxDrawn = false;
     d2PrevScreen = d2Screen;
   }
 
@@ -2887,12 +3635,14 @@ void renderD2() {
   bool skipMap = menuIsActive() && (d2Screen == D2_NAVIGATION || d2Screen == D2_MAP);
 
   switch (d2Screen) {
-    case D2_NAVIGATION:  if (!skipMap) renderD2Navigation(); break;
-    case D2_MAP:         if (!skipMap) renderMap(); break;
-    case D2_BATTERY:     renderD2Battery(); break;
-    case D2_MEDIA:       renderD2Media(); break;
-    case D2_SIGNAL:      renderD2SignalBattery(); break;
-    case D2_DEBUG:       renderD2Debug(); break;
+    case D2_NAVIGATION:        if (!skipMap) renderD2Navigation(); break;
+    case D2_MAP:               if (!skipMap) renderMap(); break;
+    case D2_BATTERY:           renderD2Battery(); break;
+    case D2_MEDIA:             renderD2Media(); break;
+    case D2_SIGNAL:            renderD2SignalBattery(); break;
+    case D2_DEBUG:             renderD2Debug(); break;
+    case D2_KITT_VOICEBOX:     renderD2Voicebox(false); break;
+    case D2_KITT_VOICEBOX_BTN: renderD2Voicebox(true);  break;
     default: break;
   }
 }
@@ -3215,7 +3965,6 @@ void d1Core0Task(void* param) {
   while (appState != STATE_NAVIGATE && appState != STATE_WEBSERVER) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
-  servoSetup();
   const TickType_t interval = pdMS_TO_TICKS(33);  // ~30 FPS
   for (;;) {
     if (appState == STATE_NAVIGATE) {
@@ -3225,7 +3974,6 @@ void d1Core0Task(void* param) {
       if (!liveData.masterPresent && !navRoute.waitingForGPS) {
         updateLiveDataFromSim();
       }
-      servoUpdate();
       __sync_synchronize();
       renderD1();
     }
@@ -3245,15 +3993,15 @@ void setup() {
   hspi.begin(27, SD_MISO, 13, SD_CS);
   digitalWrite(SD_CS, HIGH);
 
-  // Init displays
+  // Init displays (brightness gets re-applied after SD load below if cfg exists)
   disp1.init();
   disp1.setRotation(3);
-  disp1.setBrightness(200);
+  disp1.setBrightness(pctTo255(g_brightD1));
   disp1.fillScreen(TFT_BLACK);
 
   disp2.init();
   disp2.setRotation(0);
-  disp2.setBrightness(200);
+  disp2.setBrightness(pctTo255(g_brightD2));
   disp2.fillScreen(TFT_BLACK);
 
   sprite1.setColorDepth(16);
@@ -3293,6 +4041,9 @@ void setup() {
   SD.mkdir("/music");
   loadSongList();
   loadScreenState();
+  loadBrightnessState();
+  disp1.setBrightness(pctTo255(g_brightD1));
+  disp2.setBrightness(pctTo255(g_brightD2));
   setupI2CSlave();
 
   // RTC on Wire (GPIO 12=SDA, 32=SCL)

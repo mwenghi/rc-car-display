@@ -82,6 +82,7 @@ struct LiveData {
   bool forward;
   bool horn_active;
   uint8_t video_camera;
+  uint8_t theme;          // 0=Default 1=KITT 2=Police 3=Sci-fi 4=Retro
 
   // Head tracker (from CRSF channels)
   float ht_heading;   // degrees 0-360
@@ -104,12 +105,19 @@ struct LiveData {
 
 LiveData liveData = {0};
 
-// ─── I2C receive buffer (ISR-safe) ──────────────────────────────────────────
+// ─── I2C receive ring buffer (ISR-safe) ─────────────────────────────────────
 
 #define I2C_BUF_SIZE 34
-volatile uint8_t i2cRxBuf[I2C_BUF_SIZE];
-volatile uint8_t i2cRxLen = 0;
-volatile bool i2cNewData = false;
+#define I2C_QUEUE_SIZE 16  // hold up to 16 messages
+
+struct I2CMsg {
+  uint8_t data[I2C_BUF_SIZE];
+  uint8_t len;
+};
+
+volatile I2CMsg i2cQueue[I2C_QUEUE_SIZE];
+volatile uint8_t i2cQueueHead = 0;  // written by ISR
+volatile uint8_t i2cQueueTail = 0;  // read by parseI2CMessage
 
 // Forward declarations for screen switching
 extern D1Screen d1Screen;
@@ -121,26 +129,36 @@ extern LGFX_Waveshare disp2;
 // ─── I2C receive ISR ─────────────────────────────────────────────────────────
 
 void onI2CReceive(int numBytes) {
-  uint8_t len = 0;
-  while (Wire1.available() && len < I2C_BUF_SIZE) {
-    i2cRxBuf[len++] = Wire1.read();
+  uint8_t next = (i2cQueueHead + 1) % I2C_QUEUE_SIZE;
+  if (next == i2cQueueTail) return;  // queue full, drop message
+
+  volatile I2CMsg& msg = i2cQueue[i2cQueueHead];
+  msg.len = 0;
+  while (Wire1.available() && msg.len < I2C_BUF_SIZE) {
+    msg.data[msg.len++] = Wire1.read();
   }
-  i2cRxLen = len;
-  i2cNewData = true;
+  i2cQueueHead = next;
 }
 
-// ─── Parse received message ──────────────────────────────────────────────────
+// ─── Parse all pending messages ─────────────────────────────────────────────
+
+static void _parseOneMessage(uint8_t* buf, uint8_t len);
 
 void parseI2CMessage() {
-  if (!i2cNewData) return;
-  i2cNewData = false;
+  // Drain all queued messages
+  while (i2cQueueTail != i2cQueueHead) {
+    volatile I2CMsg& msg = i2cQueue[i2cQueueTail];
+    uint8_t buf[I2C_BUF_SIZE];
+    uint8_t len = msg.len;
+    for (int i = 0; i < len; i++) buf[i] = msg.data[i];
+    i2cQueueTail = (i2cQueueTail + 1) % I2C_QUEUE_SIZE;
 
-  uint8_t len = i2cRxLen;
-  if (len < 4) return;  // minimum: type + seq + 1 payload + checksum
+    if (len < 4) continue;
+    _parseOneMessage(buf, len);
+  }
+}
 
-  // Copy from volatile buffer
-  uint8_t buf[I2C_BUF_SIZE];
-  for (int i = 0; i < len; i++) buf[i] = i2cRxBuf[i];
+static void _parseOneMessage(uint8_t* buf, uint8_t len) {
 
   // Verify checksum (XOR of all bytes except last)
   uint8_t xorSum = 0;
@@ -249,6 +267,11 @@ void parseI2CMessage() {
         liveData.horn_active = p[4];
         liveData.video_camera = p[5];
       }
+      // Theme byte added in Phase 3 — only present when payload is ≥ 7 bytes
+      // (header ~3 + payload). Older Vehicle firmware (without theme) sent 6.
+      if (len >= 10) {
+        liveData.theme = p[6];
+      }
       break;
 
     case MSG_HEAD_TRACKER:
@@ -320,11 +343,16 @@ void parseI2CMessage() {
 
     case MSG_CMD_BRIGHTNESS:
       if (len >= 6) {
+        extern uint8_t g_brightD1, g_brightD2;
+        extern void saveBrightnessState();
+        extern uint8_t pctTo255(uint8_t);
         uint8_t disp = p[0];
-        uint8_t brt = p[1];
-        if (disp == 0 || disp == 1) disp1.setBrightness(brt);
-        if (disp == 0 || disp == 2) disp2.setBrightness(brt);
-        Serial.printf("I2C: brightness D%d = %d\n", disp, brt);
+        uint8_t pct  = p[1];                   // payload is percent 0..100
+        if (pct > 100) pct = 100;
+        if (disp == 0 || disp == 1) { g_brightD1 = pct; disp1.setBrightness(pctTo255(pct)); }
+        if (disp == 0 || disp == 2) { g_brightD2 = pct; disp2.setBrightness(pctTo255(pct)); }
+        saveBrightnessState();
+        Serial.printf("I2C: brightness D%d = %d%%\n", disp, pct);
       }
       break;
 

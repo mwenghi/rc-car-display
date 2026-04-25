@@ -376,8 +376,12 @@ void setActiveRoute(const char* filename) {
 enum MenuLevel { MENU_CLOSED = 0, MENU_L1, MENU_L2, MENU_L3 };
 
 // Top-level menu entries
-enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_VEHICLE, ML1_MEDIA, ML1_RESTART, ML1_COUNT };
-static const char* menuL1Names[] = {"Screen Select", "Navigation", "Vehicle", "Media", "Restart"};
+enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_VEHICLE, ML1_MEDIA, ML1_BRIGHTNESS, ML1_THEME, ML1_RESTART, ML1_COUNT };
+static const char* menuL1Names[] = {"Screen", "Navigation", "Vehicle", "Media", "Brightness", "Theme", "Restart"};
+
+// Theme sub-items (must match Vehicle/Lights.h Theme enum order)
+enum MenuL2Theme { ML2T_DEFAULT = 0, ML2T_KITT, ML2T_POLICE, ML2T_SCIFI, ML2T_RETRO, ML2T_COUNT };
+static const char* menuL2ThemeNames[] = {"Default", "K.I.T.T.", "Police", "Sci-fi", "Retro"};
 
 // Media sub-items
 enum MenuL2Media { ML2M_PLAY_PAUSE = 0, ML2M_NEXT, ML2M_PREV, ML2M_STOP, ML2M_VOL_UP, ML2M_VOL_DOWN, ML2M_SONG_SEL, ML2M_COUNT };
@@ -385,15 +389,18 @@ static const char* menuL2MediaNames[] = {"Play/Pause", "Next Song", "Prev Song",
 
 // Restart sub-items
 enum MenuL2Restart { ML2R_DASHBOARD = 0, ML2R_VEHICLE, ML2R_COUNT };
-static const char* menuL2RestartNames[] = {"Restart Dashboard", "Restart Vehicle"};
+static const char* menuL2RestartNames[] = {"Dashboard", "Vehicle"};
 
 // Screen Select sub-items
 enum MenuL2Screen { ML2S_DISPLAY1 = 0, ML2S_DISPLAY2, ML2S_COUNT };
 static const char* menuL2ScreenNames[] = {"Display 1", "Display 2"};
 
+// Brightness sub-items (behaves like Volume +/- — menu stays open on press)
+enum MenuL2Bright { ML2B_D1_UP = 0, ML2B_D1_DOWN, ML2B_D2_UP, ML2B_D2_DOWN, ML2B_COUNT };
+
 // Navigation sub-items
 enum MenuL2Nav { ML2N_TRACK_SEL = 0, ML2N_RESTART_NAV, ML2N_STOP_NAV, ML2N_PREVIEW, ML2N_STOP_PREVIEW, ML2N_SHOW_PATH, ML2N_COUNT };
-static const char* menuL2NavNames[] = {"Track Select", "(Re)Start Nav", "Stop Nav", "Track Preview", "Stop Preview", "Show Path"};
+static const char* menuL2NavNames[] = {"Track Select", "Start Nav", "Stop Nav", "Preview", "Stop Preview", "Show Path"};
 static bool showRoutePath = true;  // toggle for route path overlay on D2
 
 struct Menu {
@@ -483,6 +490,8 @@ static int menuItemCount() {
       if (menu.l1Parent == ML1_NAVIGATION) return ML2N_COUNT;
       if (menu.l1Parent == ML1_VEHICLE) return vconfRootCount();
       if (menu.l1Parent == ML1_MEDIA) return ML2M_COUNT;
+      if (menu.l1Parent == ML1_BRIGHTNESS) return ML2B_COUNT;
+      if (menu.l1Parent == ML1_THEME) return ML2T_COUNT;
       if (menu.l1Parent == ML1_RESTART) return ML2R_COUNT;
       return 0;
     case MENU_L3:
@@ -620,6 +629,40 @@ void menuEnter() {
     if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_VOL_DOWN) {
       vconfEnqueueEvent(0xF9, 7);
       return;  // don't close menu
+    }
+    // Brightness ± (percent, menu stays open)
+    if (menu.l1Parent == ML1_BRIGHTNESS) {
+      extern uint8_t g_brightD1, g_brightD2;
+      extern void saveBrightnessState();
+      extern LGFX_TDisplay disp1;
+      extern LGFX_Waveshare disp2;
+      extern uint8_t pctTo255(uint8_t);
+      auto bump = [](uint8_t& v, int delta, int lo) {
+        int n = (int)v + delta;
+        if (n < lo)  n = lo;
+        if (n > 100) n = 100;
+        v = (uint8_t)n;
+      };
+      switch (menu.l2Idx) {
+        case ML2B_D1_UP:   bump(g_brightD1, +BRIGHTNESS_STEP, BRIGHTNESS_MIN_D1); disp1.setBrightness(pctTo255(g_brightD1)); break;
+        case ML2B_D1_DOWN: bump(g_brightD1, -BRIGHTNESS_STEP, BRIGHTNESS_MIN_D1); disp1.setBrightness(pctTo255(g_brightD1)); break;
+        case ML2B_D2_UP:   bump(g_brightD2, +BRIGHTNESS_STEP, BRIGHTNESS_MIN_D2); disp2.setBrightness(pctTo255(g_brightD2)); break;
+        case ML2B_D2_DOWN: bump(g_brightD2, -BRIGHTNESS_STEP, BRIGHTNESS_MIN_D2); disp2.setBrightness(pctTo255(g_brightD2)); break;
+      }
+      saveBrightnessState();
+      return;  // stay in menu
+    }
+
+    // Theme select — send to Vehicle via the vconf event channel (item 0xF7)
+    if (menu.l1Parent == ML1_THEME) {
+        if (menu.l2Idx >= 0 && menu.l2Idx < ML2T_COUNT) {
+            vconfEnqueueEvent(0xF7, (int16_t)menu.l2Idx);
+            extern struct LiveData liveData;
+            liveData.theme = (uint8_t)menu.l2Idx;   // optimistic local update
+            Serial.printf("Theme -> %s\n", menuL2ThemeNames[menu.l2Idx]);
+            menuClose();
+        }
+        return;
     }
 
     if (menu.l1Parent == ML1_RESTART && menu.l2Idx == ML2R_DASHBOARD) {
@@ -859,78 +902,55 @@ extern LGFX_Sprite sprite1;
 static bool menuL2IsAction(int l1, int l2) {
   if (l1 == ML1_NAVIGATION && (l2 == ML2N_RESTART_NAV || l2 == ML2N_STOP_NAV || l2 == ML2N_PREVIEW || l2 == ML2N_STOP_PREVIEW || l2 == ML2N_SHOW_PATH)) return true;
   if (l1 == ML1_MEDIA && l2 != ML2M_SONG_SEL) return true;
+  if (l1 == ML1_BRIGHTNESS) return true;
+  if (l1 == ML1_THEME) return true;
   if (l1 == ML1_RESTART) return true;
   return false;
 }
 
-// Helper: draw a menu list (2x font, 240x135 landscape)
-// itemH=24px, title=18px, bottom bar=14px → 4 visible items
+// Helper: draw a menu list — fullscreen 240x135, 3 rows × 45 px, size-3 font
+// (no title or hint bars — readable through FPV goggles)
 static void drawMenuList(const char* title, const char** items, int count,
                          int selIdx, const char* breadcrumb) {
+  (void)title; (void)breadcrumb;  // kept for API compatibility
   sprite1.fillScreen(TFT_BLACK);
 
-  // Title bar (size 1 for breadcrumb + title)
-  sprite1.fillRect(0, 0, 240, 16, 0x0841);
-  sprite1.setTextSize(1);
-  if (breadcrumb) {
-    sprite1.setTextColor(0x4A69);
-    sprite1.setCursor(4, 4);
-    sprite1.print(breadcrumb);
-    sprite1.setTextColor(TFT_CYAN);
-    sprite1.print(" > ");
-  } else {
-    sprite1.setTextColor(TFT_CYAN);
-    sprite1.setCursor(4, 4);
-  }
-  sprite1.print(title);
-
-  // Preview indicator
-  if (menu.previewMode) {
-    if ((millis() / 400) % 2) sprite1.fillCircle(230, 8, 4, TFT_RED);
-  }
-
-  // Items area: y=18..120 (102px), item height=24, max 4 visible
   int totalItems = count + 1;  // +1 for Back/Exit
-  sprite1.setTextSize(2);  // 12x16 chars
-
-  if (count == 0 && menu.level == MENU_L3) {
-    sprite1.setTextColor(0x8410);
-    sprite1.setCursor(30, 50);
-    sprite1.print("(empty)");
-  }
-
-  int maxVis = 4;
+  const int rowH    = 45;
+  const int maxVis  = 3;
   int visCount = min(maxVis, totalItems);
   int startIdx = selIdx - visCount / 2;
   if (startIdx < 0) startIdx = 0;
   if (startIdx + visCount > totalItems) startIdx = totalItems - visCount;
 
+  if (count == 0 && menu.level == MENU_L3) {
+    sprite1.setTextSize(3);
+    sprite1.setTextColor(0x8410);
+    sprite1.setCursor(60, 56);
+    sprite1.print("(empty)");
+  }
+
+  sprite1.setTextSize(3);
   for (int i = 0; i < visCount; i++) {
     int idx = startIdx + i;
-    int y = 18 + i * 24;
+    int y   = i * rowH;
     bool selected = (idx == selIdx);
 
     if (selected) {
-      sprite1.fillRect(2, y, 236, 22, 0x0841);
-      sprite1.drawRect(2, y, 236, 22, TFT_CYAN);
+      sprite1.fillRect(2, y + 2, 236, rowH - 4, 0x0841);
+      sprite1.drawRect(2, y + 2, 236, rowH - 4, TFT_CYAN);
       sprite1.setTextColor(TFT_WHITE);
     } else {
       sprite1.setTextColor(0x8410);
     }
 
-    sprite1.setCursor(8, y + 3);
+    sprite1.setCursor(8, y + 10);
     if (idx < count) {
       sprite1.print(items[idx]);
-      // Arrow ">" for submenu items, no arrow for actions
       bool hasSubmenu = (menu.level < MENU_L3) && !menuL2IsAction(menu.l1Parent, idx);
-      if (hasSubmenu && menu.level != MENU_L1) {
+      if (hasSubmenu) {
         sprite1.setTextColor(selected ? 0x6B6D : 0x4208);
-        sprite1.setCursor(224, y + 3);
-        sprite1.print(">");
-      }
-      if (menu.level == MENU_L1) {
-        sprite1.setTextColor(selected ? 0x6B6D : 0x4208);
-        sprite1.setCursor(224, y + 3);
+        sprite1.setCursor(216, y + 10);
         sprite1.print(">");
       }
     } else {
@@ -939,25 +959,23 @@ static void drawMenuList(const char* title, const char** items, int count,
     }
   }
 
-  // Scroll indicators
+  // Scroll indicators (size 1, in the row gaps so they don't overlap text)
   sprite1.setTextSize(1);
   if (startIdx > 0) {
     sprite1.setTextColor(0x4A69);
-    sprite1.setCursor(116, 17);
+    sprite1.setCursor(116, 0);
     sprite1.print("^");
   }
   if (startIdx + visCount < totalItems) {
     sprite1.setTextColor(0x4A69);
-    sprite1.setCursor(116, 115);
+    sprite1.setCursor(116, 127);
     sprite1.print("v");
   }
 
-  // Bottom hint bar
-  sprite1.fillRect(0, 122, 240, 13, 0x0841);
-  sprite1.setTextColor(0x4A69);
-  sprite1.setTextSize(1);
-  sprite1.setCursor(20, 125);
-  sprite1.print("UP/DN:browse  OK:select  BACK:up");
+  // Preview indicator (was in the old title bar)
+  if (menu.previewMode && (millis() / 400) % 2) {
+    sprite1.fillCircle(232, 8, 4, TFT_RED);
+  }
 
   sprite1.pushSprite(0, 0);
 }
@@ -973,49 +991,36 @@ static VConfItem* _vconfChildItemWrapper(int idx) {
 static void drawVehicleList(const char* title, const char* breadcrumb,
                             int count, int selIdx,
                             VConfItem* (*getItem)(int)) {
+  (void)title; (void)breadcrumb;
   sprite1.fillScreen(TFT_BLACK);
 
-  // Title bar
-  sprite1.fillRect(0, 0, 240, 16, 0x0841);
-  sprite1.setTextSize(1);
-  if (breadcrumb) {
-    sprite1.setTextColor(0x4A69);
-    sprite1.setCursor(4, 4);
-    sprite1.print(breadcrumb);
-    sprite1.setTextColor(TFT_CYAN);
-    sprite1.print(" > ");
-  } else {
-    sprite1.setTextColor(TFT_CYAN);
-    sprite1.setCursor(4, 4);
-  }
-  sprite1.print(title);
-
   int totalItems = count + 1;  // +1 for Back
-  int maxVis = 4;
+  const int rowH   = 45;
+  const int maxVis = 3;
   int visCount = min(maxVis, totalItems);
   int startIdx = selIdx - visCount / 2;
   if (startIdx < 0) startIdx = 0;
   if (startIdx + visCount > totalItems) startIdx = totalItems - visCount;
 
   if (count == 0) {
-    sprite1.setTextSize(2);
+    sprite1.setTextSize(3);
     sprite1.setTextColor(0x8410);
-    sprite1.setCursor(18, 50);
+    sprite1.setCursor(36, 56);
     sprite1.print("No items");
   }
 
   for (int i = 0; i < visCount; i++) {
     int idx = startIdx + i;
-    int y = 18 + i * 24;
+    int y   = i * rowH;
     bool selected = (idx == selIdx);
 
     if (selected) {
-      sprite1.fillRect(2, y, 236, 22, 0x0841);
-      sprite1.drawRect(2, y, 236, 22, TFT_CYAN);
+      sprite1.fillRect(2, y + 2, 236, rowH - 4, 0x0841);
+      sprite1.drawRect(2, y + 2, 236, rowH - 4, TFT_CYAN);
     }
 
-    sprite1.setTextSize(2);
-    sprite1.setCursor(8, y + 3);
+    sprite1.setTextSize(3);
+    sprite1.setCursor(8, y + 10);
 
     if (idx < count) {
       VConfItem* item = getItem(idx);
@@ -1024,44 +1029,45 @@ static void drawVehicleList(const char* title, const char* breadcrumb,
       sprite1.setTextColor(selected ? TFT_WHITE : 0x8410);
       sprite1.print(item->name);
 
-      // Value on right side
-      sprite1.setTextSize(1);
       bool isEditing = (vconf.editing && vconf.editSlot == item->id);
 
+      // Value on right side — size 2 so it fits regardless of name length
+      sprite1.setTextSize(2);
       switch (item->type) {
         case VCONF_TOGGLE: {
           bool on = item->value != 0;
           sprite1.setTextColor(on ? TFT_GREEN : TFT_RED);
-          sprite1.setCursor(200, y + 7);
+          sprite1.setCursor(196, y + 14);
           sprite1.print(on ? "ON" : "OFF");
           break;
         }
         case VCONF_NUMBER: {
           int16_t dispVal = isEditing ? vconf.editValue : item->value;
           sprite1.setTextColor(isEditing ? TFT_YELLOW : (selected ? 0xC618 : 0x6B6D));
-          sprite1.setCursor(188, y + 7);
+          sprite1.setCursor(160, y + 14);
           if (isEditing) sprite1.printf("[%d]", dispVal);
-          else sprite1.printf("%d", dispVal);
+          else            sprite1.printf("%d", dispVal);
           break;
         }
         case VCONF_OPTIONS: {
           sprite1.setTextColor(selected ? TFT_CYAN : 0x6B6D);
-          sprite1.setCursor(160, y + 7);
+          sprite1.setCursor(140, y + 14);
           int oi = constrain(item->value, 0, item->optionCount - 1);
           if (item->optionCount > 0)
             sprite1.print(item->optionLabels[oi]);
           break;
         }
         case VCONF_ACTION: {
+          sprite1.setTextSize(3);
           sprite1.setTextColor(selected ? TFT_YELLOW : 0x4208);
-          sprite1.setCursor(224, y + 7);
+          sprite1.setCursor(216, y + 10);
           sprite1.print("!");
           break;
         }
         case VCONF_SUBMENU: {
+          sprite1.setTextSize(3);
           sprite1.setTextColor(selected ? 0x6B6D : 0x4208);
-          sprite1.setCursor(224, y + 3);
-          sprite1.setTextSize(2);
+          sprite1.setCursor(216, y + 10);
           sprite1.print(">");
           break;
         }
@@ -1076,24 +1082,14 @@ static void drawVehicleList(const char* title, const char* breadcrumb,
   sprite1.setTextSize(1);
   if (startIdx > 0) {
     sprite1.setTextColor(0x4A69);
-    sprite1.setCursor(116, 17);
+    sprite1.setCursor(116, 0);
     sprite1.print("^");
   }
   if (startIdx + visCount < totalItems) {
     sprite1.setTextColor(0x4A69);
-    sprite1.setCursor(116, 115);
+    sprite1.setCursor(116, 127);
     sprite1.print("v");
   }
-
-  // Bottom hint bar
-  sprite1.fillRect(0, 122, 240, 13, 0x0841);
-  sprite1.setTextColor(0x4A69);
-  sprite1.setTextSize(1);
-  sprite1.setCursor(20, 125);
-  if (vconf.editing)
-    sprite1.print("UP/DN:adjust  OK:confirm  BACK:cancel");
-  else
-    sprite1.print("UP/DN:browse  OK:select  BACK:up");
 
   sprite1.pushSprite(0, 0);
 }
@@ -1127,6 +1123,25 @@ void renderD1Menu() {
       for (int i = 0; i < ML2M_COUNT; i++) mediaNames[i] = menuL2MediaNames[i];
       mediaNames[ML2M_PLAY_PAUSE] = (liveData.media_state == 1) ? "Pause" : "Play";
       drawMenuList("MEDIA", mediaNames, ML2M_COUNT, menu.l2Idx, "Media");
+    } else if (menu.l1Parent == ML1_THEME) {
+      static char tBuf[ML2T_COUNT][16];
+      const char* tNames[ML2T_COUNT];
+      for (int i = 0; i < ML2T_COUNT; i++) {
+        snprintf(tBuf[i], 16, "%s%s",
+                 (liveData.theme == (uint8_t)i) ? "* " : "  ",
+                 menuL2ThemeNames[i]);
+        tNames[i] = tBuf[i];
+      }
+      drawMenuList("THEME", tNames, ML2T_COUNT, menu.l2Idx, "Theme");
+    } else if (menu.l1Parent == ML1_BRIGHTNESS) {
+      extern uint8_t g_brightD1, g_brightD2;
+      static char b1u[20], b1d[20], b2u[20], b2d[20];
+      snprintf(b1u, sizeof(b1u), "D1 +  (%u%%)", g_brightD1);
+      snprintf(b1d, sizeof(b1d), "D1 -  (%u%%)", g_brightD1);
+      snprintf(b2u, sizeof(b2u), "D2 +  (%u%%)", g_brightD2);
+      snprintf(b2d, sizeof(b2d), "D2 -  (%u%%)", g_brightD2);
+      const char* brightNames[ML2B_COUNT] = { b1u, b1d, b2u, b2d };
+      drawMenuList("BRIGHTNESS", brightNames, ML2B_COUNT, menu.l2Idx, "Brightness");
     } else if (menu.l1Parent == ML1_RESTART) {
       drawMenuList("RESTART", menuL2RestartNames, ML2R_COUNT,
                    menu.l2Idx, "Restart");
