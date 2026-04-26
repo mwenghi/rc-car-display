@@ -13,7 +13,8 @@
 #define MSG_GPS       0x04
 #define MSG_NAV       0x05
 #define MSG_SENSOR    0x06
-#define MSG_VEHICLE   0x07
+#define MSG_VEHICLE        0x07
+#define MSG_PRECHECK_TEXT  0x09
 #define MSG_HEAD_TRACKER 0x08
 #define MSG_CMD_SCREEN     0x10
 #define MSG_CMD_BRIGHTNESS 0x11
@@ -83,6 +84,11 @@ struct LiveData {
   bool horn_active;
   uint8_t video_camera;
   uint8_t theme;          // 0=Default 1=KITT 2=Police 3=Sci-fi 4=Retro
+
+  // Pre-check (0x09) — step idx 0xFF means "idle / hide screen"
+  uint8_t  precheck_step;
+  char     precheck_text[31];   // null-terminated phrase (≤30 chars)
+  uint16_t precheck_phrase_ms;  // measured audio length of current phrase (0 = unknown)
 
   // Head tracker (from CRSF channels)
   float ht_heading;   // degrees 0-360
@@ -271,6 +277,26 @@ static void _parseOneMessage(uint8_t* buf, uint8_t len) {
       // (header ~3 + payload). Older Vehicle firmware (without theme) sent 6.
       if (len >= 10) {
         liveData.theme = p[6];
+      }
+      break;
+
+    case MSG_PRECHECK_TEXT:
+      // payload: [step_idx, text_len, text bytes…, dur_lo, dur_hi]
+      // (text capped at 30; duration is little-endian uint16, 0 = unknown).
+      if (len >= 5) {
+        liveData.precheck_step = p[0];
+        uint8_t tlen = p[1];
+        if (tlen > 30) tlen = 30;
+        if (tlen > 0) memcpy(liveData.precheck_text, p + 2, tlen);
+        liveData.precheck_text[tlen] = '\0';
+        // Duration field added in Phase 5 — only present when payload includes
+        // the extra 2 bytes after the text. Older firmware sends shorter packet.
+        if (len >= (uint8_t)(7 + tlen)) {
+          liveData.precheck_phrase_ms =
+              (uint16_t)p[2 + tlen] | ((uint16_t)p[2 + tlen + 1] << 8);
+        } else {
+          liveData.precheck_phrase_ms = 0;
+        }
       }
       break;
 

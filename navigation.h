@@ -376,16 +376,91 @@ void setActiveRoute(const char* filename) {
 enum MenuLevel { MENU_CLOSED = 0, MENU_L1, MENU_L2, MENU_L3 };
 
 // Top-level menu entries
-enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_VEHICLE, ML1_MEDIA, ML1_BRIGHTNESS, ML1_THEME, ML1_RESTART, ML1_COUNT };
-static const char* menuL1Names[] = {"Screen", "Navigation", "Vehicle", "Media", "Brightness", "Theme", "Restart"};
+enum MenuL1Item { ML1_SCREEN_SEL = 0, ML1_NAVIGATION, ML1_VEHICLE, ML1_MEDIA, ML1_AUDIO, ML1_BRIGHTNESS, ML1_THEME, ML1_PRECHECK, ML1_RESTART, ML1_COUNT };
+static const char* menuL1Names[] = {"Screen", "Navigation", "Vehicle", "Media", "Audio", "Brightness", "Theme", "Pre-check", "Restart"};
+
+// Audio sub-items — Volume +/- (action items) + the Voice vconf item.
+enum MenuL2Audio { ML2A_VOL_UP = 0, ML2A_VOL_DOWN, ML2A_VOICE, ML2A_COUNT };
+
+// Virtual VConfItems for Volume +/- (so they render in the same drawVehicleList).
+// Both fire 0xF9 (media event) with values 6/7 — the Vehicle handler maps those
+// to volumeUp/Down() and persists the new level to EEPROM.
+static VConfItem _volumeUp;
+static VConfItem _volumeDown;
+static bool _audioVirtInit = false;
+static void _audioEnsureVirt() {
+  if (_audioVirtInit) return;
+  _volumeUp.defined = true;
+  _volumeUp.id      = 0xF9;
+  _volumeUp.type    = VCONF_ACTION;
+  _volumeUp.flags   = 0;
+  strncpy(_volumeUp.name, "Volume +", VCONF_LABEL_LEN - 1);
+  _volumeUp.value   = 6;
+  _volumeUp.groupId = 0xFF;
+
+  _volumeDown = _volumeUp;
+  strncpy(_volumeDown.name, "Volume -", VCONF_LABEL_LEN - 1);
+  _volumeDown.value = 7;
+
+  _audioVirtInit = true;
+}
+static VConfItem* audioRootItem(int idx) {
+  _audioEnsureVirt();
+  switch (idx) {
+    case ML2A_VOL_UP:   return &_volumeUp;
+    case ML2A_VOL_DOWN: return &_volumeDown;
+    case ML2A_VOICE:    return vconfFindItem(4);   // VCONF_ID_PRECHECK_VOICE
+    default: return nullptr;
+  }
+}
+
+// Pre-check sub-items (Start/Stop + 3 vconf settings rendered inline).
+// Vconf ids 4/5/6 must match Vehicle's VCONF_ID_PRECHECK_VOICE / _AUTO / _INT.
+#define VCONF_ID_PRECHECK_VOICE_DASH  4
+#define VCONF_ID_PRECHECK_AUTO_DASH   5
+#define VCONF_ID_PRECHECK_INT_DASH    6
+// Voice now lives in the Audio menu; Pre-check only owns Start/Stop + auto-mode settings.
+enum MenuL2Precheck { ML2P_START = 0, ML2P_STOP, ML2P_AUTO, ML2P_INTERVAL, ML2P_COUNT };
+
+// Virtual VConfItem instances for Start/Stop — vconfItemEnter() will fire
+// vconfEnqueueEvent(item->id, item->value) which Vehicle handles as 0xF6.
+static VConfItem _precheckStart;
+static VConfItem _precheckStop;
+static bool _precheckVirtInit = false;
+static void _precheckEnsureVirt() {
+  if (_precheckVirtInit) return;
+  _precheckStart.defined = true;
+  _precheckStart.id      = 0xF6;
+  _precheckStart.type    = VCONF_ACTION;
+  _precheckStart.flags   = 0;
+  strncpy(_precheckStart.name, "Start", VCONF_LABEL_LEN - 1);
+  _precheckStart.value   = 1;
+  _precheckStart.groupId = 0xFF;
+
+  _precheckStop = _precheckStart;
+  strncpy(_precheckStop.name, "Stop", VCONF_LABEL_LEN - 1);
+  _precheckStop.value = 0;
+  _precheckVirtInit = true;
+}
+
+static VConfItem* precheckRootItem(int idx) {
+  _precheckEnsureVirt();
+  switch (idx) {
+    case ML2P_START:    return &_precheckStart;
+    case ML2P_STOP:     return &_precheckStop;
+    case ML2P_AUTO:     return vconfFindItem(VCONF_ID_PRECHECK_AUTO_DASH);
+    case ML2P_INTERVAL: return vconfFindItem(VCONF_ID_PRECHECK_INT_DASH);
+    default: return nullptr;
+  }
+}
 
 // Theme sub-items (must match Vehicle/Lights.h Theme enum order)
 enum MenuL2Theme { ML2T_DEFAULT = 0, ML2T_KITT, ML2T_POLICE, ML2T_SCIFI, ML2T_RETRO, ML2T_COUNT };
 static const char* menuL2ThemeNames[] = {"Default", "K.I.T.T.", "Police", "Sci-fi", "Retro"};
 
-// Media sub-items
-enum MenuL2Media { ML2M_PLAY_PAUSE = 0, ML2M_NEXT, ML2M_PREV, ML2M_STOP, ML2M_VOL_UP, ML2M_VOL_DOWN, ML2M_SONG_SEL, ML2M_COUNT };
-static const char* menuL2MediaNames[] = {"Play/Pause", "Next Song", "Prev Song", "Stop", "Volume +", "Volume -", "Song Select"};
+// Media sub-items (volume controls live in the Audio menu now).
+enum MenuL2Media { ML2M_PLAY_PAUSE = 0, ML2M_NEXT, ML2M_PREV, ML2M_STOP, ML2M_SONG_SEL, ML2M_COUNT };
+static const char* menuL2MediaNames[] = {"Play/Pause", "Next Song", "Prev Song", "Stop", "Song Select"};
 
 // Restart sub-items
 enum MenuL2Restart { ML2R_DASHBOARD = 0, ML2R_VEHICLE, ML2R_COUNT };
@@ -490,13 +565,15 @@ static int menuItemCount() {
       if (menu.l1Parent == ML1_NAVIGATION) return ML2N_COUNT;
       if (menu.l1Parent == ML1_VEHICLE) return vconfRootCount();
       if (menu.l1Parent == ML1_MEDIA) return ML2M_COUNT;
+      if (menu.l1Parent == ML1_AUDIO) return ML2A_COUNT;
       if (menu.l1Parent == ML1_BRIGHTNESS) return ML2B_COUNT;
       if (menu.l1Parent == ML1_THEME) return ML2T_COUNT;
+      if (menu.l1Parent == ML1_PRECHECK) return ML2P_COUNT;
       if (menu.l1Parent == ML1_RESTART) return ML2R_COUNT;
       return 0;
     case MENU_L3:
       if (menu.l1Parent == ML1_SCREEN_SEL) {
-        if (menu.l2Parent == ML2S_DISPLAY1) return D1_SCREEN_COUNT;
+        if (menu.l2Parent == ML2S_DISPLAY1) return D1_USER_SCREEN_COUNT;
         if (menu.l2Parent == ML2S_DISPLAY2) return D2_SCREEN_COUNT;
       }
       if (menu.l1Parent == ML1_NAVIGATION && menu.l2Parent == ML2N_TRACK_SEL)
@@ -622,13 +699,13 @@ void menuEnter() {
       menuClose();
       return;
     }
-    if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_VOL_UP) {
-      vconfEnqueueEvent(0xF9, 6);
-      return;  // don't close menu — allow repeated presses
-    }
-    if (menu.l1Parent == ML1_MEDIA && menu.l2Idx == ML2M_VOL_DOWN) {
-      vconfEnqueueEvent(0xF9, 7);
-      return;  // don't close menu
+    // Audio — Volume +/- are virtual VCONF_ACTION items (id=0xF9, val=6/7);
+    // Voice is the real vconf options item (id=4). All three go through
+    // vconfItemEnter and the menu stays open for repeated tweaks.
+    if (menu.l1Parent == ML1_AUDIO) {
+      VConfItem* item = audioRootItem(menu.l2Idx);
+      if (item) vconfItemEnter(item);
+      return;
     }
     // Brightness ± (percent, menu stays open)
     if (menu.l1Parent == ML1_BRIGHTNESS) {
@@ -651,6 +728,19 @@ void menuEnter() {
       }
       saveBrightnessState();
       return;  // stay in menu
+    }
+
+    // Pre-check — Start/Stop fire vconf events; Voice/Auto/Interval enter
+    // vconf edit mode in-place. The menu stays open for setting tweaks but
+    // CLOSES after Start/Stop so the same throttle gesture that confirms
+    // the final pre-check step doesn't immediately re-trigger Start.
+    if (menu.l1Parent == ML1_PRECHECK) {
+      VConfItem* item = precheckRootItem(menu.l2Idx);
+      if (item) {
+        vconfItemEnter(item);
+        if (item->type == VCONF_ACTION) menuClose();
+      }
+      return;
     }
 
     // Theme select — send to Vehicle via the vconf event channel (item 0xF7)
@@ -709,7 +799,7 @@ void menuEnter() {
       extern D1Screen d1Screen;
       extern void saveScreenState();
       extern const char* d1ScreenNames[];
-      if (menu.l3Idx >= 0 && menu.l3Idx < D1_SCREEN_COUNT) {
+      if (menu.l3Idx >= 0 && menu.l3Idx < D1_USER_SCREEN_COUNT) {
         d1Screen = (D1Screen)menu.l3Idx;
         saveScreenState();
         Serial.printf("D1 -> %s\n", d1ScreenNames[menu.l3Idx]);
@@ -902,8 +992,10 @@ extern LGFX_Sprite sprite1;
 static bool menuL2IsAction(int l1, int l2) {
   if (l1 == ML1_NAVIGATION && (l2 == ML2N_RESTART_NAV || l2 == ML2N_STOP_NAV || l2 == ML2N_PREVIEW || l2 == ML2N_STOP_PREVIEW || l2 == ML2N_SHOW_PATH)) return true;
   if (l1 == ML1_MEDIA && l2 != ML2M_SONG_SEL) return true;
+  if (l1 == ML1_AUDIO && l2 != ML2A_VOICE) return true;   // vol+/- act, voice opens edit
   if (l1 == ML1_BRIGHTNESS) return true;
   if (l1 == ML1_THEME) return true;
+  if (l1 == ML1_PRECHECK) return true;
   if (l1 == ML1_RESTART) return true;
   return false;
 }
@@ -1043,25 +1135,43 @@ static void drawVehicleList(const char* title, const char* breadcrumb,
         }
         case VCONF_NUMBER: {
           int16_t dispVal = isEditing ? vconf.editValue : item->value;
+          char buf[12];
+          if (isEditing) snprintf(buf, sizeof(buf), "[%d]", dispVal);
+          else            snprintf(buf, sizeof(buf), "%d", dispVal);
+          int textW = (int)strlen(buf) * 12;   // size-2 char ≈ 12 px wide
           sprite1.setTextColor(isEditing ? TFT_YELLOW : (selected ? 0xC618 : 0x6B6D));
-          sprite1.setCursor(160, y + 14);
-          if (isEditing) sprite1.printf("[%d]", dispVal);
-          else            sprite1.printf("%d", dispVal);
+          sprite1.setCursor(235 - textW, y + 14);
+          sprite1.print(buf);
           break;
         }
         case VCONF_OPTIONS: {
           sprite1.setTextColor(selected ? TFT_CYAN : 0x6B6D);
-          sprite1.setCursor(140, y + 14);
           int oi = constrain(item->value, 0, item->optionCount - 1);
-          if (item->optionCount > 0)
-            sprite1.print(item->optionLabels[oi]);
+          if (item->optionCount > 0) {
+            const char* lbl = item->optionLabels[oi];
+            int textW = (int)strlen(lbl) * 12;
+            sprite1.setCursor(238 - textW, y + 14);
+            sprite1.print(lbl);
+          }
           break;
         }
         case VCONF_ACTION: {
-          sprite1.setTextSize(3);
-          sprite1.setTextColor(selected ? TFT_YELLOW : 0x4208);
-          sprite1.setCursor(216, y + 10);
-          sprite1.print("!");
+          // Volume +/- (id 0xF9) show the current volume on the right so the
+          // user gets numeric feedback after each press; other actions keep
+          // the simple "!" indicator.
+          if (item->id == 0xF9) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%u", (unsigned)liveData.media_volume);
+            int textW = (int)strlen(buf) * 12;   // size-2 ≈ 12 px wide
+            sprite1.setTextColor(selected ? TFT_YELLOW : 0x6B6D);
+            sprite1.setCursor(235 - textW, y + 14);
+            sprite1.print(buf);
+          } else {
+            sprite1.setTextSize(3);
+            sprite1.setTextColor(selected ? TFT_YELLOW : 0x4208);
+            sprite1.setCursor(216, y + 10);
+            sprite1.print("!");
+          }
           break;
         }
         case VCONF_SUBMENU: {
@@ -1123,6 +1233,11 @@ void renderD1Menu() {
       for (int i = 0; i < ML2M_COUNT; i++) mediaNames[i] = menuL2MediaNames[i];
       mediaNames[ML2M_PLAY_PAUSE] = (liveData.media_state == 1) ? "Pause" : "Play";
       drawMenuList("MEDIA", mediaNames, ML2M_COUNT, menu.l2Idx, "Media");
+    } else if (menu.l1Parent == ML1_AUDIO) {
+      drawVehicleList("AUDIO", "Audio", ML2A_COUNT, menu.l2Idx, audioRootItem);
+    } else if (menu.l1Parent == ML1_PRECHECK) {
+      drawVehicleList("PRE-CHECK", "Pre-check", ML2P_COUNT,
+                      menu.l2Idx, precheckRootItem);
     } else if (menu.l1Parent == ML1_THEME) {
       static char tBuf[ML2T_COUNT][16];
       const char* tNames[ML2T_COUNT];
@@ -1151,7 +1266,7 @@ void renderD1Menu() {
 
   if (menu.level == MENU_L3) {
     if (menu.l1Parent == ML1_SCREEN_SEL && menu.l2Parent == ML2S_DISPLAY1) {
-      drawMenuList("DISPLAY 1", d1ScreenNames, D1_SCREEN_COUNT,
+      drawMenuList("DISPLAY 1", d1ScreenNames, D1_USER_SCREEN_COUNT,
                    menu.l3Idx, "Screens");
     } else if (menu.l1Parent == ML1_SCREEN_SEL && menu.l2Parent == ML2S_DISPLAY2) {
       drawMenuList("DISPLAY 2", d2ScreenNames, D2_SCREEN_COUNT,

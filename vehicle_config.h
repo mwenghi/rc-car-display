@@ -290,8 +290,8 @@ bool vconfItemEnter(VConfItem* item) {
       return false;
 
     case VCONF_ACTION:
-      vconfEnqueueEvent(item->id, 1);
-      Serial.printf("VConf: action %d triggered\n", item->id);
+      vconfEnqueueEvent(item->id, item->value);
+      Serial.printf("VConf: action %d triggered (val=%d)\n", item->id, item->value);
       return true;
 
     case VCONF_SUBMENU:

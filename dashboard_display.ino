@@ -123,7 +123,9 @@ enum D1Screen {
   D1_IMU,             // IMU tilt visualization
   D1_ABOUT,           // about/credits
   D1_GOGGLES,         // head tracker 3D cuboid + compass
-  D1_SCREEN_COUNT
+  D1_USER_SCREEN_COUNT,                     // cycle/menu stops here
+  D1_PRECHECK_TEXT = D1_USER_SCREEN_COUNT,  // auto-switched only
+  D1_SCREEN_COUNT,
 };
 
 // D2 screens (Waveshare, 172x320)
@@ -275,7 +277,7 @@ void checkScreenButton() {
     }
   } else if (!pressed && btnWasPressed) {
     if (!longPressHandled && (millis() - btnPressStart < LONG_PRESS_MS)) {
-      d1Screen = (D1Screen)(((int)d1Screen + 1) % D1_SCREEN_COUNT);
+      d1Screen = (D1Screen)(((int)d1Screen + 1) % D1_USER_SCREEN_COUNT);
       Serial.printf("D1 -> %s\n", d1ScreenNames[d1Screen]);
       saveScreenState();
     }
@@ -587,8 +589,9 @@ void pollMenuInput() {
     if (liveData.steer_pos < 76) { menuNext(); lastSteerAction = millis(); }
     else if (liveData.steer_pos > 178) { menuPrev(); lastSteerAction = millis(); }
   }
-  // Throttle forward ~26% (raw ~160 → throttle_pct ~26) then back to ~0 to confirm
-  if (liveData.throttle_pct > 25) throttleWasHigh = true;
+  // Throttle forward >40% then back to ~0 to confirm (matches the Pre-check
+  // gesture threshold on the Vehicle side).
+  if (liveData.throttle_pct > 40) throttleWasHigh = true;
   if (throttleWasHigh && liveData.throttle_pct < 5) {
     throttleWasHigh = false;
     menuEnter();
@@ -3423,7 +3426,111 @@ void renderD2Placeholder(const char* title) {
 
 // ─── Screen dispatchers ──────────────────────────────────────────────────────
 
+// Renders the current pre-check step text centered on a black panel.
+// Word-wraps onto up to 3 lines at the largest font size that fits.
+void renderD1Precheck() {
+  sprite1.fillScreen(TFT_BLACK);
+  const char* txt = liveData.precheck_text;
+  if (!txt[0]) {
+    sprite1.pushSprite(0, 0);
+    return;
+  }
+
+  // Try sizes 4 → 3 → 2 until the longest single word fits
+  int len = (int)strlen(txt);
+  int maxWord = 0, cur = 0;
+  for (int i = 0; i <= len; i++) {
+    if (txt[i] == ' ' || txt[i] == '\0') {
+      if (cur > maxWord) maxWord = cur;
+      cur = 0;
+    } else cur++;
+  }
+  int textSize = 4;
+  while (textSize > 1 && maxWord * 6 * textSize > 230) textSize--;
+
+  // Greedy word-wrap: each line packs as many words as fit in 240 px
+  const int charW = 6 * textSize;
+  const int charH = 8 * textSize;
+  int maxCharsPerLine = 240 / charW;
+  if (maxCharsPerLine > 31) maxCharsPerLine = 31;
+
+  char buf[31 * 4]; int bufLen = 0;
+  char lines[4][32]; int lineCount = 0;
+  // Tokenize on space
+  int i = 0;
+  while (i < len && lineCount < 4) {
+    // Skip leading spaces
+    while (i < len && txt[i] == ' ') i++;
+    int line_len = 0;
+    int j = i;
+    while (j < len) {
+      // Find next word end
+      int word_start = j;
+      while (j < len && txt[j] != ' ') j++;
+      int word_len = j - word_start;
+      // Fits on current line?
+      int needed = (line_len == 0) ? word_len : (line_len + 1 + word_len);
+      if (needed > maxCharsPerLine) {
+        if (line_len == 0) {
+          // word longer than line — hard split
+          word_len = maxCharsPerLine;
+          j = word_start + word_len;
+        } else {
+          j = word_start;   // push next word to next line
+          break;
+        }
+      }
+      if (line_len > 0) lines[lineCount][line_len++] = ' ';
+      memcpy(lines[lineCount] + line_len, txt + word_start, word_len);
+      line_len += word_len;
+      while (j < len && txt[j] == ' ') j++;
+    }
+    lines[lineCount][line_len] = '\0';
+    if (line_len > 0) lineCount++;
+    i = j;
+  }
+
+  int totalH = lineCount * charH + (lineCount - 1) * 4;
+  int yStart = (135 - totalH) / 2;
+  if (yStart < 0) yStart = 0;
+  sprite1.setTextSize(textSize);
+  sprite1.setTextColor(TFT_WHITE);
+  for (int li = 0; li < lineCount; li++) {
+    int lineW = (int)strlen(lines[li]) * charW;
+    int x = (240 - lineW) / 2;
+    if (x < 0) x = 0;
+    sprite1.setCursor(x, yStart + li * (charH + 4));
+    sprite1.print(lines[li]);
+  }
+
+  // Tiny step indicator at the bottom (e.g. "Step 3 / 16")
+  if (liveData.precheck_step != 0xFF) {
+    sprite1.setTextSize(1);
+    sprite1.setTextColor(0x6B6D);
+    char s[20];
+    snprintf(s, sizeof(s), "Step %u / 16", (unsigned)(liveData.precheck_step + 1));
+    sprite1.setCursor((240 - (int)strlen(s) * 6) / 2, 125);
+    sprite1.print(s);
+  }
+
+  sprite1.pushSprite(0, 0);
+}
+
 void renderD1() {
+  // Auto-switch D1 to the pre-check text screen while a check is running;
+  // restore the previous user screen when it finishes / aborts.
+  static D1Screen _savedD1 = D1_DASHBOARD;
+  static bool     _wasInPrecheck = false;
+  bool inPrecheck = (liveData.precheck_step != 0xFF);
+  if (inPrecheck && !_wasInPrecheck) {
+    if (d1Screen != D1_PRECHECK_TEXT) _savedD1 = d1Screen;
+    d1Screen = D1_PRECHECK_TEXT;
+    _wasInPrecheck = true;
+  } else if (!inPrecheck && _wasInPrecheck) {
+    if (d1Screen == D1_PRECHECK_TEXT) d1Screen = _savedD1;
+    _wasInPrecheck = false;
+  }
+
   // Clear on screen change
   if (d1Screen != d1PrevScreen) {
     sprite1.fillScreen(TFT_BLACK);
@@ -3431,19 +3538,20 @@ void renderD1() {
     d1PrevScreen = d1Screen;
   }
 
-  // Menu takes over D1 when active
-  if (menuIsActive()) {
+  // Menu takes over D1 when active (pre-check text overlays it though)
+  if (menuIsActive() && !inPrecheck) {
     renderD1Menu();
     return;
   }
 
   switch (d1Screen) {
-    case D1_DASHBOARD:   renderD1DashboardThemed(); break;
-    case D1_NAVIGATION:  renderD1Navigation(); break;
-    case D1_MEDIA:       renderD1Media(); break;
-    case D1_ABOUT:       renderD1About(); break;
-    case D1_IMU:         renderD1IMU(); break;
-    case D1_GOGGLES:     renderD1Goggles(); break;
+    case D1_DASHBOARD:     renderD1DashboardThemed(); break;
+    case D1_NAVIGATION:    renderD1Navigation();      break;
+    case D1_MEDIA:         renderD1Media();           break;
+    case D1_ABOUT:         renderD1About();           break;
+    case D1_IMU:           renderD1IMU();             break;
+    case D1_GOGGLES:       renderD1Goggles();         break;
+    case D1_PRECHECK_TEXT: renderD1Precheck();        break;
     default: break;
   }
 }
@@ -3540,17 +3648,63 @@ void renderD2Voicebox(bool withButtons) {
 
   uint32_t now = millis();
 
+  // ── KITT "speaks" only at certain times ──────────────────────────────────
+  //   Pre-check active : a short burst (~3 s) on every step change. The
+  //                      system_sound_active flag stays HIGH the whole
+  //                      sequence because phrases are looped on the DY-SV5W,
+  //                      so we trigger off precheck_step deltas instead.
+  //   Normal mode      : random bursts — 2..15 s of speech, then 5..60 s of
+  //                      silence, repeat. Picks fresh durations each cycle.
+  // When silent, targets collapse to 0 and the existing decay animation
+  // makes the columns shrink to the centre line on their own.
+  bool inPrecheck = (liveData.precheck_step != 0xFF);
+  bool speaking;
+  if (inPrecheck) {
+    // Burst length comes from the auto-generated precheck_durations.h on the
+    // Vehicle side and is forwarded in the MSG_PRECHECK_TEXT frame, so the
+    // voicebox speaks for exactly as long as the audio actually plays. If the
+    // duration is missing (older firmware or info-only step) we fall back to
+    // a short fixed window so the bars still flicker briefly.
+    static uint8_t  prevStep      = 0xFF;
+    static uint32_t precheckUntil = 0;
+    if (liveData.precheck_step != prevStep) {
+      prevStep = liveData.precheck_step;
+      uint32_t durMs = liveData.precheck_phrase_ms ? liveData.precheck_phrase_ms : 1500;
+      precheckUntil = now + durMs;
+    }
+    speaking = (now < precheckUntil);
+  } else {
+    static bool     burstOn      = false;
+    static uint32_t burstUntilMs = 0;
+    static uint32_t nextBurstMs  = 0;     // 0 sentinel → seed on first frame
+    if (nextBurstMs == 0) nextBurstMs = now + (uint32_t)random(5000, 60001);
+    if (burstOn) {
+      if (now >= burstUntilMs) {
+        burstOn      = false;
+        nextBurstMs  = now + (uint32_t)random(5000, 60001);
+      }
+    } else if (now >= nextBurstMs) {
+      burstOn      = true;
+      burstUntilMs = now + (uint32_t)random(2000, 15001);
+    }
+    speaking = burstOn;
+  }
+
   // Pick new master "intensity" (~10 Hz). Centre column is ALWAYS the tallest;
   // the two side columns share an identical, smaller height so the modulator
   // reads as a single audio level rather than three independent signals.
   if (now - lastTargetMs >= 100) {
     lastTargetMs = now;
-    int master = random(3, N + 1);                    // 3..N (centre)
-    int side   = master - 1 - (int)random(0, 3);      // 1..3 cells shorter
-    if (side < 1) side = 1;
-    target[0] = side;
-    target[1] = master;
-    target[2] = side;
+    if (speaking) {
+      int master = random(3, N + 1);                    // 3..N (centre)
+      int side   = master - 1 - (int)random(0, 3);      // 1..3 cells shorter
+      if (side < 1) side = 1;
+      target[0] = side;
+      target[1] = master;
+      target[2] = side;
+    } else {
+      target[0] = target[1] = target[2] = 0;
+    }
   }
 
   // Throttle frame to ~30 fps; smooth + draw deltas
@@ -4041,6 +4195,7 @@ void setup() {
   SD.mkdir("/music");
   loadSongList();
   loadScreenState();
+  liveData.precheck_step = 0xFF;   // start hidden — Vehicle pushes 0..15 once active
   loadBrightnessState();
   disp1.setBrightness(pctTo255(g_brightD1));
   disp2.setBrightness(pctTo255(g_brightD2));
